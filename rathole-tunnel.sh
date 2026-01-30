@@ -347,7 +347,7 @@ sleep 1
 [server]
 bind_addr = "${local_ip}:${tunnel_port}"
 default_token = "musixal_tunnel"
-heartbeat_interval = 30
+heartbeat_interval = 20
 
 [server.transport]
 type = "tcp"
@@ -378,13 +378,14 @@ EOF
 [Unit]
 Description=Rathole Server (Iran)
 After=network.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
 ExecStart=${config_dir}/rathole ${iran_config_file}
 Restart=always
 RestartSec=5s
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 LimitNPROC=infinity
 TasksMax=infinity
@@ -557,13 +558,14 @@ EOF
 [Unit]
 Description=Rathole Client (Kharej) - Tunnel ${j}
 After=network.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
 ExecStart=${config_dir}/rathole ${kharej_config_file}
 Restart=always
 RestartSec=5s
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 LimitNPROC=infinity
 TasksMax=infinity
@@ -572,16 +574,20 @@ TasksMax=infinity
 WantedBy=multi-user.target
 EOF
 
-    # Reload, enable and start the individual service
-    systemctl daemon-reload
+done
+
+# Reload systemd once after creating all service files
+systemctl daemon-reload
+
+# Enable and start all created services
+for ((j=1; j<=$SERVER_NUM; j++)); do
+    local kharej_instance_service_name="rathole-kharej-s${j}.service"
     systemctl enable "$kharej_instance_service_name" >/dev/null 2>&1
     if systemctl restart "$kharej_instance_service_name"; then
         echo -e "${GREEN}Service '$kharej_instance_service_name' started for tunnel $j.${NC}"
     else
         echo -e "${RED}Failed to start service '$kharej_instance_service_name'.${NC}"
     fi
-
-    sleep 1
 done
 
 #______________________________________________________________________________End of the loop
