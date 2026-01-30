@@ -109,14 +109,12 @@ download_and_extract_rathole() {
     # Check operating system
     if [[ $(uname) == "Linux" ]]; then
         ARCH=$(uname -m)
-        DOWNLOAD_URL=$(curl -sSL https://api.github.com/repos/rapiz1/rathole/releases/latest | grep -o "https://.*$ARCH.*linux.*zip" | head -n 1)
+        # Fetch the latest release from the official rathole-org repository
+        DOWNLOAD_URL=$(curl -sSL https://api.github.com/repos/rathole-org/rathole/releases/latest | grep -oP "https://github.com/rathole-org/rathole/releases/download/[v\d.]+/rathole-$ARCH-unknown-linux-(gnu|musl)\.zip" | head -n 1)
     else
         echo -e "${RED}Unsupported operating system.${NC}"
         sleep 1
         exit 1
-    fi
-    if [[ "$ARCH" == "x86_64" ]]; then
-    	DOWNLOAD_URL='https://github.com/Musixal/rathole-tunnel/raw/main/core/rathole.zip'
     fi
 
     if [ -z "$DOWNLOAD_URL" ]; then
@@ -187,6 +185,33 @@ display_rathole_core_status() {
     echo -e "\e[93m═════════════════════════════════════════════\e[0m"  
 }
 
+# Function to apply instant optimizations
+apply_instant_optimizations() {
+    echo -e "${YELLOW}Applying network optimizations...${NC}"
+
+    # Apply instant optimizations using sysctl -w
+    sysctl -w fs.file-max=67108864 >/dev/null 2>&1
+    sysctl -w net.core.somaxconn=65536 >/dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=32768 >/dev/null 2>&1
+    if lsmod | grep -q "tcp_bbr"; then
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+    else
+        modprobe tcp_bbr && sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || echo -e "${RED}BBR not supported.${NC}"
+    fi
+    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
+
+    # Make optimizations persistent across reboots
+    cat << EOF > /etc/sysctl.d/99-rathole.conf
+fs.file-max = 67108864
+net.core.somaxconn = 65536
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+EOF
+
+    echo -e "${GREEN}Optimizations applied and made persistent.${NC}"
+}
+
 
 # Function for configuring tunnel
 configure_tunnel() {
@@ -244,6 +269,7 @@ check_ipv6() {
 
 # Function to configure Iran server
 iran_server_configuration() {  
+    apply_instant_optimizations
     clear
     echo -e "${YELLOW}Configuring IRAN server...${NC}\n" 
     
@@ -316,7 +342,7 @@ else
 fi
 sleep 1
 
-    # Generate server configuration file
+    # Generate server configuration file with optimized parameters
     cat << EOF > "$iran_config_file"
 [server]
 bind_addr = "${local_ip}:${tunnel_port}"
@@ -328,6 +354,8 @@ type = "tcp"
 
 [server.transport.tcp]
 nodelay = $nodelay
+keepalive_secs = 20
+keepalive_interval = 8
 
 EOF
 
@@ -345,7 +373,7 @@ EOF
     echo -e "${GREEN}IRAN server configuration completed.${NC}\n"
     echo -e "Starting Rathole server as a service...\n"
 
-    # Create the systemd service unit file
+    # Create the systemd service unit file with hardening
     cat << EOF > "$iran_service_file"
 [Unit]
 Description=Rathole Server (Iran)
@@ -355,7 +383,11 @@ After=network.target
 Type=simple
 ExecStart=${config_dir}/rathole ${iran_config_file}
 Restart=always
-RestartSec=3
+RestartSec=5s
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -377,17 +409,28 @@ EOF
         return 1
     fi
 
-    # Start the service
-    if systemctl start "$iran_service_name"; then
+    # Start the service (use restart to ensure new config is loaded)
+    if systemctl restart "$iran_service_name"; then
         echo -e "${GREEN}Service '$iran_service_name' started.${NC}"
     else
-        echo -e "${RED}Failed to start service '$service_name'. Please check your system configuration.${NC}"
+        echo -e "${RED}Failed to start service '$iran_service_name'. Please check your system configuration.${NC}"
         return 1
     fi
 }
 
 # Function for configuring Kharej server
 kharej_server_configuration() {
+    apply_instant_optimizations
+
+    # Cleanup any existing individual services to prevent orphans
+    echo -e "${YELLOW}Cleaning up existing tunnel services...${NC}"
+    for svc in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service'); do
+        systemctl stop "$svc" >/dev/null 2>&1
+        systemctl disable "$svc" >/dev/null 2>&1
+    done
+    rm -f /etc/systemd/system/rathole-kharej-s*.service
+    systemctl daemon-reload
+
     clear
     echo -e "${YELLOW}Configuring kharej server...${NC}\n"
     
@@ -467,8 +510,10 @@ for ((j=1; j<=$SERVER_NUM; j++)); do
    		fi
 	done
 
-    #this new format allow us to build various client_port.toml 
-    local kharej_config_file="${config_dir}/client_p${tunnel_port}.toml"
+    # Unique configuration and service naming per tunnel
+    local kharej_config_file="${config_dir}/client_s${j}_p${tunnel_port}.toml"
+    local kharej_instance_service_name="rathole-kharej-s${j}.service"
+    local kharej_instance_service_file="/etc/systemd/system/${kharej_instance_service_name}"
 
 #Add IPv6 Support
 local_ip='0.0.0.0'
@@ -479,19 +524,21 @@ if check_ipv6 "$SERVER_ADDR"; then
     SERVER_ADDR="${SERVER_ADDR%]}"
 fi
 
-    # Generate server configuration file
+    # Generate client configuration file with optimized parameters
     cat << EOF > "$kharej_config_file"
 [client]
 remote_addr = "${SERVER_ADDR}:${tunnel_port}"
 default_token = "musixal_tunnel"
 heartbeat_timeout = 40
-retry_interval = 1
+retry_interval = 5
 
 [client.transport]
 type = "tcp"
 
 [client.transport.tcp]
 nodelay = $nodelay
+keepalive_secs = 20
+keepalive_interval = 8
 
 EOF
 
@@ -505,61 +552,42 @@ local_addr = "${local_ip}:${port}"
 EOF
     done
 
-# Now modify ExecCommand for our service file
-    EXEC_COMMAND+="${config_dir}/rathole ${kharej_config_file} & "
-    sleep 1
-done
-  
-#______________________________________________________________________________End of the loop
-    
-    #delete last &
-    EXEC_COMMAND="${EXEC_COMMAND% & }"
-    #Need that last '
-    EXEC_COMMAND+="'"
-    
-    echo ''
-    echo -e "${GREEN}Kharej server configuration completed.${NC}\n"
-    echo -e "${GREEN}Starting Rathole server as a service...${NC}\n"
-
-    # Create the systemd service unit file
-    cat << EOF > "$kharej_service_file"
+    # Create an individual systemd service unit file for this tunnel instance
+    cat << EOF > "$kharej_instance_service_file"
 [Unit]
-Description=Rathole Server (Kharej)
+Description=Rathole Client (Kharej) - Tunnel ${j}
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$EXEC_COMMAND
+ExecStart=${config_dir}/rathole ${kharej_config_file}
 Restart=always
-RestartSec=3
+RestartSec=5s
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd to read the new unit file
-    if systemctl daemon-reload; then
-        echo "Systemd daemon reloaded."
+    # Reload, enable and start the individual service
+    systemctl daemon-reload
+    systemctl enable "$kharej_instance_service_name" >/dev/null 2>&1
+    if systemctl restart "$kharej_instance_service_name"; then
+        echo -e "${GREEN}Service '$kharej_instance_service_name' started for tunnel $j.${NC}"
     else
-        echo -e "${RED}Failed to reload systemd daemon. Please check your system configuration.${NC}"
-        return 1
+        echo -e "${RED}Failed to start service '$kharej_instance_service_name'.${NC}"
     fi
 
-    # Enable the service to start on boot
-    if systemctl enable "$kharej_service_name" >/dev/null 2>&1; then
-        echo -e "${GREEN}Service '$kharej_service_name' enabled to start on boot.${NC}"
-    else
-        echo -e "${RED}Failed to enable service '$kharej_service_name'. Please check your system configuration.${NC}"
-        return 1
-    fi
+    sleep 1
+done
 
-    # Start the service
-    if systemctl start "$kharej_service_name"; then
-        echo -e "${GREEN}Service '$kharej_service_name' started.${NC}"
-    else
-        echo -e "${RED}Failed to start service '$kharej_service_name'. Please check your system configuration.${NC}"
-        return 1
-    fi
+#______________________________________________________________________________End of the loop
+
+    echo ''
+    echo -e "${GREEN}Kharej server configuration completed.${NC}\n"
 
 }
 
@@ -590,24 +618,22 @@ if [ -f "$iran_config_file" ]; then
   rm -f "$iran_config_file"
 fi
 
-# Check if client.toml exists and delete it
-if ls $kharej_config_file 1> /dev/null 2>&1; then
-    for file in $kharej_config_file; do
-         rm -f $file
-    done
-fi
+# Check if client configs exist and delete them
+rm -f ${config_dir}/client_s*_p*.toml
 
     # remove cronjob created by thi script
     delete_cron_job 
     echo ''
-    # Stop and disable the client service if it exists
-    if [[ -f "$kharej_service_file" ]]; then
-        if systemctl is-active "$kharej_service_name" &>/dev/null; then
-            systemctl stop "$kharej_service_name"
-            systemctl disable "$kharej_service_name"
+    # Stop and disable all individual client services
+    for service_file in /etc/systemd/system/rathole-kharej-s*.service; do
+        if [ -f "$service_file" ]; then
+            service_name=$(basename "$service_file")
+            systemctl stop "$service_name"
+            systemctl disable "$service_name"
+            rm -f "$service_file"
+            echo -e "${GREEN}Service '$service_name' removed.${NC}"
         fi
-        rm -f "$kharej_service_file"
-    fi
+    done
 
 
     # Stop and disable the Iran server service if it exists
@@ -638,11 +664,18 @@ check_tunnel_status() {
     echo -e "${YELLOW}Checking tunnel status...${NC}\n"
     sleep 1
     
-    # Check if the rathole-client-kharej service is active
-    if systemctl is-active --quiet "$kharej_service_name"; then
-        echo -e "${GREEN}Kharej service is running on this server.${NC}"
-    else
-        echo -e "${RED}Kharej service is not running on this server.${NC}"
+    # Check all Kharej services
+    local kharej_found=false
+    for service in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service' | sort -u); do
+        kharej_found=true
+        if systemctl is-active --quiet "$service"; then
+            echo -e "${GREEN}Service '$service' is running.${NC}"
+        else
+            echo -e "${RED}Service '$service' is NOT running.${NC}"
+        fi
+    done
+    if [ "$kharej_found" = false ]; then
+         echo -e "${RED}No Kharej services found.${NC}"
     fi
     
     echo ''
@@ -661,11 +694,14 @@ restart_services() {
     echo ''
     echo -e "${YELLOW}Restarting IRAN & Kharej services...${NC}\n"
     sleep 1
-    # Check if rathole-client-kharej.service exists
-    if systemctl list-units --type=service | grep -q "$kharej_service_name"; then
-        systemctl restart "$kharej_service_name"
-        echo -e "${GREEN}Kharej service restarted.${NC}"
-    fi
+
+    # Restart all Kharej services
+    local kharej_found=false
+    for service in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service' | sort -u); do
+        kharej_found=true
+        systemctl restart "$service"
+        echo -e "${GREEN}Service '$service' restarted.${NC}"
+    done
 
     # Check if rathole-server-iran.service exists
     if systemctl list-units --type=service | grep -q "$iran_service_name"; then
@@ -674,7 +710,7 @@ restart_services() {
     fi
 
     # If neither service exists
-    if ! systemctl list-units --type=service | grep -q "$kharej_service_name" && \
+    if [ "$kharej_found" = false ] && \
        ! systemctl list-units --type=service | grep -q "$iran_service_name"; then
         echo -e "${RED}There is no service to restart.${NC}"
     fi
@@ -806,13 +842,13 @@ add_cron_job_menu() {
     # Path ro reset file
     reset_path='/etc/reset.sh'
     
-    #add cron job to kill the running rathole processes
+    #add cron job to restart services safely
     cat << EOF > "$reset_path"
 #! /bin/bash
-pids=\$(pgrep rathole)
-sudo kill -9 \$pids
-sudo systemctl daemon-reload
-sudo systemctl restart $service_name
+# Find all rathole services and restart them
+for svc in \$(systemctl list-units --type=service --all | grep -oE 'rathole-(iran|kharej-s[0-9]+)\.service' | sort -u); do
+    sudo systemctl restart \$svc
+done
 EOF
 
     # make it +x !
