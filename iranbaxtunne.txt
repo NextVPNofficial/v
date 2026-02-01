@@ -1,0 +1,32 @@
+IranBax Tunnel - High Performance Stealth Tunnel
+================================================
+
+This tunnel is based on Hysteria2, a next-generation proxy/tunneling tool
+specifically designed to overcome network environments with high packet loss
+and aggressive filtering (like Iran's GFW).
+
+Why Hysteria2?
+--------------
+1. QUIC-based: It uses the QUIC protocol (UDP), which is naturally more
+   resistant to certain types of TCP-based filtering and "parazits" (interference).
+2. Brutal Congestion Control: Unlike standard TCP or QUIC, Hysteria2 uses
+   a custom "brutal" algorithm that can saturate your link even when
+   there is 10-20% packet loss. This is perfect for unstable data center
+   connections.
+3. Obfuscation (obfs): Every packet is obfuscated with a password-based XOR
+   mask, making it look like random UDP data. This bypasses Deep Packet
+   Inspection (DPI) that looks for known protocol signatures (like Rathole,
+   V2Ray, or standard TLS).
+4. Masquerading: It can mimic a standard HTTPS (HTTP/3) connection.
+
+How it works:
+-------------
+- Kharej Server: Acts as the Hysteria2 server. It listens on a UDP port
+  of your choice.
+- Iran Server: Acts as the Hysteria2 client. It establishes a persistent
+  tunnel to the Kharej server and forwards any local ports you specify
+  directly to the Kharej server over the encrypted QUIC stream.
+
+This method is currently one of the most effective ways to bridge Iran and
+Kharej servers because it doesn't rely on standard TCP handshakes which are
+frequently disrupted.
