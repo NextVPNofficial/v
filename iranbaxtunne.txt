@@ -1,0 +1,36 @@
+IranBax Tunnel - High Performance & Stealth Tunneling
+===================================================
+
+This script provides two of the most effective methods for bridging Iran
+and Kharej servers in 2024-2025.
+
+Option 1: Hysteria2 (UDP / QUIC) - High Performance
+--------------------------------------------------
+- Best for: Extremely unstable networks and high packet loss.
+- Protocol: Modified QUIC (UDP).
+- Features: "Brutal" congestion control that forces throughput even when
+  the ISP is trying to drop packets.
+- Obfuscation: XOR-based password masking to look like random UDP traffic.
+
+Option 2: Reality (TCP / TLS) - Ultimate Stealth
+-----------------------------------------------
+- Best for: When your Kharej IP is being carefully watched or UDP is restricted.
+- Protocol: VLESS-Reality (TCP).
+- Features: Indistinguishable from a real website (like Google or Microsoft).
+- Security: It uses a real TLS certificate from a legitimate website of your
+  choice. It doesn't have a "fingerprint" that GFW can detect.
+- Resilience: Because it looks like standard HTTPS traffic to a famous site,
+  it is the least likely to be blocked. If your IP is partially blocked,
+  Reality has the best chance of staying under the radar.
+
+Important Note on Blocked IPs:
+-----------------------------
+If your Kharej IP is completely blocked (nulled) by the GFW, direct
+connections will not work regardless of the protocol. In such cases:
+1. Try using an IPv6 address if available.
+2. Use a relay server or a clean CDN IP.
+3. Re-deploy the tunnel using a different port or a different SNI (website
+   to masquerade as).
+
+The IranBax Tunnel script automatically applies system-level optimizations
+(BBR) to ensure both methods work at their peak potential.
