@@ -1,0 +1,42 @@
+Rathole Tunnel Optimization and Crash Prevention
+=============================================
+
+I have analyzed and optimized the `rathole-tunnel.sh` script to address crashing issues and improve performance while ensuring compatibility with aggressive network environments.
+
+Key Changes and Improvements:
+
+1.  Individual Systemd Services (Kharej/Client Side):
+    - Migrated from a single fragile service to individual systemd units (e.g., `rathole-kharej-s1.service`).
+    - This allows independent monitoring and automatic recovery of each tunnel by systemd.
+    - Added automated cleanup of orphaned services when re-configuring tunnels.
+    - Optimized service management to reduce CPU load during the configuration process.
+
+2.  Service Hardening and Reliable Recovery:
+    - Increased resource limits for all rathole services:
+        * `LimitNOFILE=1048576` (Prevents crashes due to file descriptor exhaustion)
+        * `LimitNPROC=infinity`
+        * `TasksMax=infinity`
+    - Enhanced restart policy for production reliability:
+        * `Restart=always`
+        * `RestartSec=5s`
+        * `StartLimitIntervalSec=0` and `StartLimitBurst=0` (Ensures systemd will keep trying to restart the service forever, no matter how many times it fails)
+
+3.  System-Wide Performance & Performance Tweaks:
+    - Added `apply_instant_optimizations` function to apply and persist critical network tweaks:
+        * TCP BBR Congestion Control for high-speed tunneling and lower latency.
+        * Increased `net.core.somaxconn` and `net.core.netdev_max_backlog` for high concurrency.
+        * Increased `fs.file-max` to handle massive connection volumes.
+        * Enabled TCP Fast Open.
+    - Optimizations are now persistent across reboots via `/etc/sysctl.d/99-rathole.conf`.
+
+4.  Rathole Tunneling & Stealthiness Optimizations:
+    - Connection Stability: Added TCP keepalive settings (`keepalive_secs = 20`, `keepalive_interval = 8`) to ensure tunnels stay active through aggressive firewalls.
+    - Jitter Buffer: Optimized `heartbeat_interval` (20s) and `heartbeat_timeout` (40s) to handle network jitter without triggering false-positive disconnects.
+    - Stealthiness: Increased `retry_interval` to 5 seconds. This prevents "hammering" the server during outages, which makes the connection less suspicious to DPI systems and reduces CPU usage.
+    - Protocol Safety: The script now uses the latest official releases from the official `rathole-org` GitHub repository, which includes the most recent security and protocol improvements.
+
+5.  Robust Management Functions:
+    - Refactored `destroy_tunnel`, `check_tunnel_status`, and `restart_services` to be fully multi-service aware.
+    - Improved the reset cron-job to safely restart all active services using systemd's state machine instead of forced PID killing.
+
+These improvements provide a production-grade tunneling environment designed to be resilient, high-performing, and stealthy.
