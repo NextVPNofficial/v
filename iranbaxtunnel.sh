@@ -27,6 +27,10 @@ SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
 XRAY_SERVICE="iranbax-xray.service"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
+XRAY_BIN="${XRAY_CORE_DIR}/xray"
+XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
+XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
+
 # Ensure directories exist
 mkdir -p "$CONFIG_DIR" "$SAVED_RELAYS_DIR"
 
@@ -90,6 +94,16 @@ read_ip() {
     done
 }
 
+# Helper to check if a port is used by our services
+is_port_ours() {
+    local port=$1
+    # Check if port is in any of our config files
+    if grep -q "\"port\": $port" "$XRAY_CONFIG" 2>/dev/null || grep -q "\"port\": $port" "$XRAY_RELAY_CONFIG" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 read_port() {
     local prompt=$1
     local var_name=$2
@@ -104,13 +118,19 @@ read_port() {
         if is_valid_port "$input"; then
             if [[ "$check_usage" == "true" ]]; then
                 if check_port_in_use "$input"; then
-                    local p_info=$(ss -tulnp | grep ":${input} " | head -n1)
-                    if echo "$p_info" | grep -iq "xray"; then
-                        echo -e "${YELLOW}Warning: Port $input is currently used by Xray. It will be replaced.${NC}"
+                    local p_all=$(ss -tulnp | grep ":${input} ")
+                    if echo "$p_all" | grep -iq "xray"; then
+                        if is_port_ours "$input"; then
+                             echo -e "${YELLOW}Notice: Port $input is currently used by an Iranbax tunnel. It will be updated.${NC}"
+                        else
+                             echo -e "${YELLOW}Warning: Port $input is used by an external Xray process.${NC}"
+                             read -p "Replace it? (y/n, default: n): " force_x
+                             [[ "$force_x" != "y" ]] && { flush_stdin; continue; }
+                        fi
                     else
-                        echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
-                        echo "$p_info"
-                        read -p "Do you want to use this port anyway? (y/n, default: n): " force_port
+                        echo -e "${RED}Error: Port $input is already in use by another process:${NC}"
+                        echo "$p_all"
+                        read -p "Force use this port? (y/n, default: n): " force_port
                         if [[ "$force_port" != "y" ]]; then
                             flush_stdin
                             continue
@@ -326,8 +346,6 @@ check_ipv6() {
 
 # --- Xray-Reality Logic ---
 
-XRAY_BIN="${XRAY_CORE_DIR}/xray"
-XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
 XRAY_SERVICE="iranbax-xray.service"
 
 download_xray() {
@@ -521,7 +539,6 @@ manage_xray_relay() {
     done
 }
 
-XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
 parse_vmess_link() {
@@ -627,26 +644,22 @@ setup_xray_relay() {
         # Fix flat JSON format (address directly in settings)
         if echo "$outbound" | jq -e '.settings.address' >/dev/null 2>&1; then
              echo -e "${YELLOW}Converting flat JSON to standard Xray outbound...${NC}"
-             local addr=$(echo "$outbound" | jq -r '.settings.address')
-             local port=$(echo "$outbound" | jq -r '.settings.port')
-             local id=$(echo "$outbound" | jq -r '.settings.id')
-             local flow=$(echo "$outbound" | jq -r '.settings.flow')
-             local proto=$(echo "$outbound" | jq -r '.protocol')
-
-             outbound=$(jq -n \
-                --arg addr "$addr" \
-                --argjson port "$port" \
-                --arg id "$id" \
-                --arg flow "$flow" \
-                --arg proto "$proto" \
-                --argjson ss "$(echo "$outbound" | jq '.streamSettings')" \
-                '{
-                    "protocol": $proto,
-                    "settings": {
-                        "vnext": [{"address": $addr, "port": $port, "users": [{"id": $id, "encryption": "none", "flow": $flow}]}]
-                    },
-                    "streamSettings": $ss
-                }')
+             outbound=$(echo "$outbound" | jq '
+                if .protocol == "vless" or .protocol == "vmess" then
+                    .settings = {
+                        "vnext": [{
+                            "address": .settings.address,
+                            "port": .settings.port,
+                            "users": [{
+                                "id": (.settings.id // .settings.users[0].id),
+                                "encryption": (.settings.encryption // "none"),
+                                "flow": (.settings.flow // ""),
+                                "security": (.settings.security // "auto")
+                            }]
+                        }]
+                    }
+                else . end
+             ')
         fi
     else
         echo -e "${RED}Error: Invalid format. Paste JSON or vless/vmess link.${NC}"
@@ -667,28 +680,66 @@ setup_xray_relay() {
     activate_relay "$relay_name"
 }
 
+# Stop any of our services using a specific port
+stop_conflicting_service() {
+    local port=$1
+    if grep -q "\"port\": $port" "$XRAY_CONFIG" 2>/dev/null; then
+        echo -e "${YELLOW}Stopping Reality tunnel on port $port...${NC}"
+        systemctl stop "$XRAY_SERVICE" 2>/dev/null
+    fi
+    if grep -q "\"port\": $port" "$XRAY_RELAY_CONFIG" 2>/dev/null; then
+        echo -e "${YELLOW}Stopping existing Relay tunnel on port $port...${NC}"
+        systemctl stop "$XRAY_RELAY_SERVICE" 2>/dev/null
+    fi
+}
+
 activate_relay() {
     local name=$1
     local config_file="${SAVED_RELAYS_DIR}/${name}.json"
     if [[ ! -f "$config_file" ]]; then echo -e "${RED}Config $name not found!${NC}"; return; fi
 
     local outbound=$(cat "$config_file")
+    local proto=$(echo "$outbound" | jq -r '.protocol')
+    local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
+
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+
+    echo -e "\nChoose Entry Protocol for Iran Server:"
+    echo -e "1. SOCKS5 + HTTP (Most compatible, use as Proxy)"
+    echo -e "2. ${proto^^} (Relay mode, use with V2ray client)"
+    read_num "Choice (default: 1): " "in_proto_choice" 1 2
+    in_proto_choice=${in_proto_choice:-1}
+
+    local inbound_json=""
+    if [[ "$in_proto_choice" == "1" ]]; then
+        inbound_json="{
+            \"port\": $iran_port,
+            \"protocol\": \"socks\",
+            \"settings\": { \"auth\": \"noauth\", \"udp\": true },
+            \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\"] }
+        }"
+    else
+        # Match outbound protocol for seamless relaying
+        if [[ "$proto" == "vless" ]]; then
+            inbound_json="{
+                \"port\": $iran_port,
+                \"protocol\": \"vless\",
+                \"settings\": { \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }
+            }"
+        else
+            inbound_json="{
+                \"port\": $iran_port,
+                \"protocol\": \"vmess\",
+                \"settings\": { \"clients\": [ { \"id\": \"$id\" } ] }
+            }"
+        fi
+    fi
 
     cat << EOF > "$XRAY_RELAY_CONFIG"
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $iran_port,
-      "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1", "port": 0, "network": "tcp,udp" },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
-    }
-  ],
-  "outbounds": [
-    $outbound
-  ]
+  "inbounds": [ $inbound_json ],
+  "outbounds": [ $outbound ]
 }
 EOF
 
@@ -716,6 +767,7 @@ EOF
         return
     fi
 
+    stop_conflicting_service "$iran_port"
     systemctl daemon-reload
     systemctl enable "$XRAY_RELAY_SERVICE"
     systemctl restart "$XRAY_RELAY_SERVICE"
@@ -725,10 +777,30 @@ EOF
     if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
         echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
         # End-to-end check
-        if curl --connect-timeout 2 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
-             echo -e "${GREEN}[✔] End-to-end connectivity verified!${NC}"
+        echo -e "${CYAN}Performing end-to-end connectivity test...${NC}"
+        local test_cmd="curl -L --connect-timeout 5 -s -o /dev/null -w \"%{http_code}\""
+        local fetch_ok=false
+
+        if [[ "$in_proto_choice" == "1" ]]; then
+            # Test via SOCKS5
+            if [[ $($test_cmd --proxy socks5h://127.0.0.1:$iran_port http://www.google.com/generate_204) == "204" ]]; then
+                fetch_ok=true
+            fi
         else
-             echo -e "${YELLOW}[!] Service is running but local fetch failed. Check your Kharej configuration.${NC}"
+            # For VLESS/VMESS, we can't easily test with curl without a client,
+            # so we check if the port is at least listening and responding
+            if ss -tulnp | grep -q ":$iran_port "; then
+                echo -e "${YELLOW}[!] Protocol-specific relay is listening. Connect your V2ray client to verify.${NC}"
+                sleep 2
+                return
+            fi
+        fi
+
+        if [[ "$fetch_ok" == "true" ]]; then
+             echo -e "${GREEN}[✔] End-to-end connectivity verified! Proxy is working.${NC}"
+        else
+             echo -e "${RED}[!] Service is running but internet fetch failed.${NC}"
+             echo -e "${YELLOW}Possible reasons: Kharej server down, wrong UUID/Port, or blocked.${NC}"
         fi
     else
         echo -e "${RED}[✘] Failed to start Xray Relay service.${NC}"
@@ -1064,7 +1136,7 @@ clear_proxy() {
     unset http_proxy
     unset https_proxy
     sudo rm -f /etc/apt/apt.conf.d/99proxy
-    # Kill the SSH tunnel if running on port 1080
+    # Kill the setup proxy if running on port 1080
     pkill -f "ssh -D 1080"
     echo -e "${GREEN}Proxy settings cleared.${NC}"
 }
