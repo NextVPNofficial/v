@@ -170,15 +170,23 @@ fi
 
 get_public_ip() {
     local ip
+    local providers=("https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ipinfo.io/ip")
+
+    # 1. Try fetching via installation proxy if active
     if pgrep -f "ssh -D 1080" > /dev/null; then
-        # Try fetching via proxy
-        ip=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 2 https://ifconfig.me 2>/dev/null)
+        for provider in "${providers[@]}"; do
+            ip=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 2 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
+            [[ -n "$ip" ]] && { echo "${ip} (via Proxy)"; return; }
+        done
     fi
-    if [[ -z "$ip" ]]; then
-        # Try direct fetch
-        ip=$(curl -s --max-time 2 https://ifconfig.me 2>/dev/null)
-    fi
-    echo "${ip:-Unknown}"
+
+    # 2. Try direct fetch
+    for provider in "${providers[@]}"; do
+        ip=$(curl -s --max-time 2 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
+        [[ -n "$ip" ]] && { echo "$ip"; return; }
+    done
+
+    echo "Unknown"
 }
 
 get_tunnel_status() {
@@ -186,53 +194,64 @@ get_tunnel_status() {
     local active_found=false
 
     # 1. Rathole
-    if systemctl is-active --quiet "rathole-iran.service"; then
-        local tunnel_port=$(grep "bind_addr" "$IRAN_RATHOLE_CONFIG" | head -n1 | awk -F':' '{print $NF}' | tr -d '"')
-        status_line+="${YELLOW}[Rathole Server: Listening on ${tunnel_port}]${NC} "
+    if [[ -f "/etc/systemd/system/rathole-iran.service" ]]; then
+        local check="${RED}STOPPED${NC}"
+        if systemctl is-active --quiet "rathole-iran.service"; then
+            local tunnel_port=$(grep "bind_addr" "$IRAN_RATHOLE_CONFIG" | head -n1 | awk -F':' '{print $NF}' | tr -d '"')
+            check="${GREEN}LISTENING:${tunnel_port}${NC}"
+        fi
+        status_line+="${YELLOW}[Rathole Server: ${check}]${NC} "
         active_found=true
     fi
-    for svc in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service' | sort -u); do
-        if systemctl is-active --quiet "$svc"; then
-            local idx=$(echo "$svc" | grep -oE '[0-9]+')
-            local config="${CONFIG_DIR}/rathole_client_s${idx}.toml"
-            if [[ -f "$config" ]]; then
-                local remote=$(grep "remote_addr" "$config" | awk -F'"' '{print $2}')
-                local remote_ip=$(echo "$remote" | awk -F':' '{print $1}')
-                local check="${RED}OFFLINE${NC}"
-                if ping -c 1 -W 1 "$remote_ip" &>/dev/null; then check="${GREEN}ONLINE${NC}"; fi
-                status_line+="${CYAN}[Rathole: ${remote} (${check})]${NC} "
-                active_found=true
+    for config in ${CONFIG_DIR}/rathole_client_s[0-9]*.toml; do
+        if [[ -f "$config" ]]; then
+            local idx=$(basename "$config" | grep -oE '[0-9]+')
+            local svc="rathole-kharej-s${idx}.service"
+            local remote=$(grep "remote_addr" "$config" | awk -F'"' '{print $2}')
+            local remote_ip=$(echo "$remote" | awk -F':' '{print $1}')
+            local check="${RED}OFFLINE${NC}"
+            if systemctl is-active --quiet "$svc"; then
+                if ping -c 1 -W 1 "$remote_ip" &>/dev/null; then check="${GREEN}ONLINE${NC}"; else check="${YELLOW}CONNECTING${NC}"; fi
             fi
+            status_line+="${CYAN}[Rathole: ${remote} (${check})]${NC} "
+            active_found=true
         fi
     done
 
     # 2. SIT/GRE
     if ip link show "$TUNNEL_6TO4" &>/dev/null; then
-        local remote=$(ip tunnel show "$TUNNEL_6TO4" | grep -oP 'remote \K[^ ]+')
+        local remote=$(ip -o tunnel show "$TUNNEL_6TO4" | grep -oP 'remote \K[^ ]+')
         local check="${RED}OFFLINE${NC}"
-        # For SIT/GRE, we try to ping the remote tunnel IPv4
         if ping -c 1 -W 1 "172.16.0.1" &>/dev/null || ping -c 1 -W 1 "172.16.0.2" &>/dev/null; then
             check="${GREEN}ONLINE${NC}"
-        elif ping -c 1 -W 1 "$remote" &>/dev/null; then
+        elif [[ -n "$remote" ]] && ping -c 1 -W 1 "$remote" &>/dev/null; then
             check="${YELLOW}HOST-ONLY${NC}"
         fi
-        status_line+="${BLUE}[SIT/GRE: -> ${remote} (${check})]${NC} "
+        status_line+="${BLUE}[SIT/GRE: -> ${remote:-Unknown} (${check})]${NC} "
         active_found=true
     fi
 
     # 3. SSH Tunnels
-    for svc in $(systemctl list-units --type=service --all | grep -oE 'ssh-tunnel-[0-9]+\.service' | sort -u); do
-        if systemctl is-active --quiet "$svc"; then
-            local remote=$(grep -oP '@\K[^ ]+' "/etc/systemd/system/$svc")
-            local check="${RED}OFFLINE${NC}"
-            if ping -c 1 -W 1 "$remote" &>/dev/null; then check="${GREEN}ONLINE${NC}"; fi
+    for svc_file in /etc/systemd/system/ssh-tunnel-*.service; do
+        if [[ -f "$svc_file" ]]; then
+            local svc=$(basename "$svc_file")
+            local iran_port=$(echo "$svc" | grep -oE '[0-9]+')
+            local remote=$(grep -oP '@\K[^ ]+' "$svc_file" | head -n1)
+            local check="${RED}STOPPED${NC}"
+            if systemctl is-active --quiet "$svc"; then
+                if check_port_in_use "$iran_port"; then
+                    check="${GREEN}ACTIVE:${iran_port}${NC}"
+                else
+                    check="${YELLOW}FAILED/AUTH${NC}"
+                fi
+            fi
             status_line+="${MAGENTA}[SSH: -> ${remote} (${check})]${NC} "
             active_found=true
         fi
     done
 
     if [[ "$active_found" == "false" ]]; then
-        status_line="${WHITE}No active tunnels.${NC}"
+        status_line="${WHITE}No active tunnels configured.${NC}"
     fi
 
     echo -e "$status_line"
@@ -248,12 +267,12 @@ get_proxy_status() {
 
 display_topbar() {
     local current_ip=$(get_public_ip)
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC} ${YELLOW}System Exit IP:${NC} ${CYAN}${current_ip}${NC}"
-    echo -n -e "${BLUE}║${NC} ${YELLOW}Active Tunnels:${NC} "
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC} ${YELLOW}System Exit IP:   ${NC} ${CYAN}${current_ip}${NC}"
+    echo -n -e "${BLUE}║${NC} ${YELLOW}Active Tunnels:   ${NC} "
     get_tunnel_status
     echo -e "${BLUE}║${NC} ${YELLOW}Installation Proxy:${NC} $(get_proxy_status)"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
 }
 
 # Function to display ASCII logo
@@ -675,6 +694,25 @@ remove_sit_gre() {
 }
 # --- SSH Traffic Tunnel Logic ---
 
+setup_ssh_keys() {
+    local target_ip=$1
+    local ssh_user=$2
+    local ssh_port=$3
+
+    if [[ ! -f "$HOME/.ssh/id_rsa" ]]; then
+        echo -e "${YELLOW}SSH Key not found. Generating...${NC}"
+        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/id_rsa" -N ""
+    fi
+
+    echo -e "${CYAN}Copying SSH key to target server... you may be prompted for password.${NC}"
+    ssh-copy-id -o StrictHostKeyChecking=no -p "$ssh_port" "${ssh_user}@${target_ip}"
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}SSH Key copied successfully! Tunnel will now work without password.${NC}"
+    else
+        echo -e "${RED}Failed to copy SSH key.${NC}"
+    fi
+}
+
 manage_ssh_tunnel() {
     clear
     display_logo
@@ -704,13 +742,18 @@ setup_ssh_traffic() {
     read_port "Enter IRAN Port to listen on: " "iran_port" "true"
     read_port "Enter KHAREJ Port to connect to: " "kharej_port" "false"
 
+    echo ''
+    read -p "Do you want to setup SSH Keys for passwordless access? (Recommended) (y/n): " setup_keys
+    if [[ "$setup_keys" == "y" ]]; then
+        setup_ssh_keys "$target_ip" "$ssh_user" "$ssh_port"
+    fi
+
     echo -e "${YELLOW}Establishing persistent SSH tunnel via Systemd...${NC}"
-    echo -e "${CYAN}Note: It's highly recommended to setup SSH Keys for passwordless access.${NC}"
 
     local service_name="ssh-tunnel-${iran_port}.service"
     local ssh_cmd=""
 
-    local common_opts="-C -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes"
+    local common_opts="-C -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
     if [[ "$type" == "local" ]]; then
         # Local: Current server listens on iran_port and forwards to target_ip:kharej_port
@@ -869,9 +912,13 @@ installation_proxy() {
             proxy_user=${proxy_user:-root}
             read_port "Enter SSH Port (default: 22): " "proxy_port" "false" 22
 
-            echo -e "${CYAN}Establishing SSH tunnel... You may be prompted for password.${NC}"
+            echo ''
+            read -p "Do you want to setup SSH Keys first? (y/n): " setup_keys
+            [[ "$setup_keys" == "y" ]] && setup_ssh_keys "$proxy_ip" "$proxy_user" "$proxy_port"
+
+            echo -e "${CYAN}Establishing SSH tunnel...${NC}"
             # Start SSH Dynamic Forwarding in background
-            ssh -D 1080 -C -N -f -p "$proxy_port" "${proxy_user}@${proxy_ip}"
+            ssh -D 1080 -C -N -f -p "$proxy_port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${proxy_user}@${proxy_ip}"
 
             if [ $? -eq 0 ]; then
                 export http_proxy="socks5h://127.0.0.1:1080"
