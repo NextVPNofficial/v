@@ -259,13 +259,26 @@ get_tunnel_status() {
         local check="${RED}STOPPED${NC}"
         if systemctl is-active --quiet "$XRAY_SERVICE"; then
             check="${GREEN}ONLINE${NC}"
-            # Try a fetch check if we can identify the local port
             local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_CONFIG" | head -n1)
             if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
                 check="${GREEN}WORKS:${iran_port}${NC}"
             fi
         fi
         status_line+="${MAGENTA}[Reality: ${check}]${NC} "
+        active_found=true
+    fi
+
+    # 5. Xray-Relay
+    if [[ -f "/etc/systemd/system/${XRAY_RELAY_SERVICE}" ]]; then
+        local check="${RED}STOPPED${NC}"
+        if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
+            check="${GREEN}ONLINE${NC}"
+            local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_RELAY_CONFIG" | head -n1)
+            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+                check="${GREEN}WORKS:${iran_port}${NC}"
+            fi
+        fi
+        status_line+="${CYAN}[XrayRelay: ${check}]${NC} "
         active_found=true
     fi
 
@@ -356,21 +369,23 @@ manage_tunnels() {
         echo -e "2. SIT/GRE (Tunnel Wizard)"
         echo -e "3. SSH Traffic Tunnel"
         echo -e "4. Xray-Reality Tunnel (Stealth TCP)"
-        echo -e "5. ShadowTLS v3 Tunnel (Stealth TCP)"
-        echo -e "6. ICMP Tunnel (Ping-based)"
-        echo -e "7. Check All Tunnel Status"
-        echo -e "8. Back"
+        echo -e "5. Xray Relay (Import V2ray Config)"
+        echo -e "6. ShadowTLS v3 Tunnel (Stealth TCP)"
+        echo -e "7. ICMP Tunnel (Ping-based)"
+        echo -e "8. Check All Tunnel Status"
+        echo -e "9. Back"
         echo ''
-        read_num "Choose an option: " "t_choice" 1 8
+        read_num "Choose an option: " "t_choice" 1 9
         case $t_choice in
             1) manage_rathole ;;
             2) manage_sit_gre ;;
             3) manage_ssh_tunnel ;;
             4) manage_xray_reality ;;
-            5) manage_shadowtls ;;
-            6) manage_icmp_tunnel ;;
-            7) check_status ;;
-            8) break ;;
+            5) manage_xray_relay ;;
+            6) manage_shadowtls ;;
+            7) manage_icmp_tunnel ;;
+            8) check_status ;;
+            9) break ;;
             *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
         esac
     done
@@ -435,7 +450,7 @@ download_rathole() {
     DOWNLOAD_URL=$(curl -sSL https://api.github.com/repos/rathole-org/rathole/releases/latest | grep -oP "https://github.com/rathole-org/rathole/releases/download/[v\d.]+/rathole-$R_ARCH-unknown-linux-(gnu|musl)\.zip" | head -n 1)
 
     if [ -z "$DOWNLOAD_URL" ]; then
-        echo -e "${RED}Failed to retrieve download URL. Try setting up the Installation Proxy (Option 5).${NC}"
+        echo -e "${RED}Failed to retrieve download URL. Try setting up the Installation Proxy (Option 3).${NC}"
         return 1
     fi
 
@@ -686,6 +701,84 @@ manage_xray_reality() {
         3) setup_xray_reality "server" ;;
         *) return ;;
     esac
+}
+
+manage_xray_relay() {
+    clear
+    display_logo
+    echo -e "${CYAN}--- Xray Relay Management (Import V2ray) ---${NC}"
+    echo -e "1. Install Xray-core"
+    echo -e "2. Setup Relay from JSON Outbound"
+    echo -e "3. Back"
+    echo ''
+    read_num "Choose an option: " "xr_choice" 1 3
+    case $xr_choice in
+        1) download_xray; sleep 1 ;;
+        2) setup_xray_relay ;;
+        *) return ;;
+    esac
+}
+
+XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
+XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
+
+setup_xray_relay() {
+    if [[ ! -f "$XRAY_BIN" ]]; then echo -e "${RED}Install Xray-core first!${NC}"; sleep 1; return; fi
+
+    echo -e "${YELLOW}Paste your Xray Outbound JSON object (including { }):${NC}"
+    echo -e "Example: { \"protocol\": \"vless\", \"settings\": { ... }, \"streamSettings\": { ... }, \"tag\": \"proxy\" }"
+    echo -e "Press Ctrl+D when finished."
+
+    local outbound=$(cat)
+    if [[ -z "$outbound" ]]; then echo -e "${RED}No input received.${NC}"; sleep 1; return; fi
+
+    # Check if jq can parse it
+    if ! echo "$outbound" | jq . >/dev/null 2>&1; then
+        echo -e "${RED}Error: Invalid JSON format.${NC}"
+        sleep 2
+        return
+    fi
+
+    read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+
+    cat << EOF > "$XRAY_RELAY_CONFIG"
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": $iran_port,
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1", "port": 0, "network": "tcp,udp" },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    }
+  ],
+  "outbounds": [
+    $outbound
+  ]
+}
+EOF
+
+    cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
+[Unit]
+Description=Xray Relay Tunnel (Iranbax)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} -c ${XRAY_RELAY_CONFIG}
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$XRAY_RELAY_SERVICE"
+    systemctl restart "$XRAY_RELAY_SERVICE"
+    echo -e "${GREEN}Xray Relay started on port $iran_port!${NC}"
+    sleep 2
 }
 
 setup_xray_reality() {
@@ -1511,9 +1604,9 @@ cleanup_all() {
 
     # 4. Xray/Reality
     echo -e "${YELLOW}Stopping Xray services...${NC}"
-    systemctl stop "$XRAY_SERVICE" 2>/dev/null
-    systemctl disable "$XRAY_SERVICE" 2>/dev/null
-    rm -f "/etc/systemd/system/${XRAY_SERVICE}"
+    systemctl stop "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
+    systemctl disable "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/${XRAY_SERVICE}" "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 
     # 5. ShadowTLS
     echo -e "${YELLOW}Stopping ShadowTLS services...${NC}"
