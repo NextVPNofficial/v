@@ -427,10 +427,7 @@ check_ipv6() {
 }
 
 download_rathole() {
-    if [[ -f "$RATHOLE_BIN" ]]; then
-        echo -e "${GREEN}Rathole already installed.${NC}"
-        return 0
-    fi
+    local custom_url=$1
     mkdir -p "$RATHOLE_CORE_DIR"
     ARCH=$(uname -m)
     # Map ARCH to rathole naming
@@ -440,33 +437,72 @@ download_rathole() {
         *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
     esac
 
-    # Add github entry to /etc/hosts to help with DNS issues in Iran
-    ENTRY="185.199.108.133 raw.githubusercontent.com"
-    if ! grep -q "$ENTRY" /etc/hosts; then
-        echo "$ENTRY" >> /etc/hosts
+    local download_url="$custom_url"
+    if [[ -z "$download_url" ]]; then
+        # Add github entry to /etc/hosts to help with DNS issues in Iran
+        ENTRY="185.199.108.133 raw.githubusercontent.com"
+        if ! grep -q "$ENTRY" /etc/hosts; then
+            echo "$ENTRY" >> /etc/hosts
+        fi
+
+        echo -e "${CYAN}Fetching latest Rathole version from GitHub...${NC}"
+        download_url=$(curl -sSL --max-time 10 https://api.github.com/repos/rathole-org/rathole/releases/latest | grep -oP "https://github.com/rathole-org/rathole/releases/download/[v\d.]+/rathole-$R_ARCH-unknown-linux-(gnu|musl)\.zip" | head -n 1)
+
+        if [ -z "$download_url" ]; then
+            echo -e "${RED}Failed to fetch tag. Try Option 3 (Proxy) or provide a Custom URL.${NC}"
+            return 1
+        fi
     fi
 
-    echo -e "${CYAN}Fetching latest Rathole version...${NC}"
-    DOWNLOAD_URL=$(curl -sSL https://api.github.com/repos/rathole-org/rathole/releases/latest | grep -oP "https://github.com/rathole-org/rathole/releases/download/[v\d.]+/rathole-$R_ARCH-unknown-linux-(gnu|musl)\.zip" | head -n 1)
-
-    if [ -z "$DOWNLOAD_URL" ]; then
-        echo -e "${RED}Failed to retrieve download URL. Try setting up the Installation Proxy (Option 3).${NC}"
+    echo -e "Downloading Rathole from $download_url..."
+    local download_dir=$(mktemp -d)
+    if curl -L --progress-bar -o "$download_dir/rathole.zip" "$download_url"; then
+        unzip -q "$download_dir/rathole.zip" -d "$RATHOLE_CORE_DIR"
+        chmod +x "$RATHOLE_BIN"
+        rm -rf "$download_dir"
+        echo -e "${GREEN}Rathole installed successfully.${NC}"
+    else
+        echo -e "${RED}Failed to download Rathole.${NC}"
+        rm -rf "$download_dir"
         return 1
     fi
+}
 
-    DOWNLOAD_DIR=$(mktemp -d)
-    curl -sSL -o "$DOWNLOAD_DIR/rathole.zip" "$DOWNLOAD_URL"
-    unzip -q "$DOWNLOAD_DIR/rathole.zip" -d "$RATHOLE_CORE_DIR"
-    chmod +x "$RATHOLE_BIN"
-    rm -rf "$DOWNLOAD_DIR"
-    echo -e "${GREEN}Rathole installed successfully.${NC}"
+install_rathole_menu() {
+    clear
+    display_logo
+    echo -e "${CYAN}--- Rathole Installation ---${NC}"
+    echo -e "1. Download Latest from GitHub"
+    echo -e "2. Download from Custom URL"
+    echo -e "3. Install from Local File (${CONFIG_DIR}/rathole.zip)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose method: " "r_inst_choice" 1 4
+    case $r_inst_choice in
+        1) download_rathole ;;
+        2)
+           read -p "Enter Custom URL: " curl
+           download_rathole "$curl"
+           ;;
+        3)
+           local lzip="${CONFIG_DIR}/rathole.zip"
+           if [[ -f "$lzip" ]]; then
+               mkdir -p "$RATHOLE_CORE_DIR"
+               unzip -q "$lzip" -d "$RATHOLE_CORE_DIR"
+               chmod +x "$RATHOLE_BIN"
+               echo -e "${GREEN}Installed from local zip.${NC}"; sleep 1
+           else
+               echo -e "${RED}File $lzip not found!${NC}"; sleep 2
+           fi
+           ;;
+    esac
 }
 
 manage_rathole() {
     clear
     display_logo
     echo -e "${CYAN}--- Rathole Tunnel Management ---${NC}"
-    echo -e "1. Install Rathole Binary"
+    echo -e "1. Install Rathole core"
     echo -e "2. Configure IRAN Server (Server Role)"
     echo -e "3. Configure KHAREJ Server (Client Role)"
     echo -e "4. Change Security Token"
@@ -475,7 +511,7 @@ manage_rathole() {
     read_num "Choose an option: " "r_choice" 1 5
 
     case $r_choice in
-        1) download_rathole; sleep 1 ;;
+        1) install_rathole_menu ;;
         2) rathole_iran_config ;;
         3) rathole_kharej_config ;;
         4) rathole_change_token ;;
@@ -650,10 +686,7 @@ XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
 XRAY_SERVICE="iranbax-xray.service"
 
 download_xray() {
-    if [[ -f "$XRAY_BIN" ]]; then
-        echo -e "${GREEN}Xray-core already installed.${NC}"
-        return 0
-    fi
+    local custom_url=$1
     mkdir -p "$XRAY_CORE_DIR"
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -662,27 +695,59 @@ download_xray() {
         *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
     esac
 
-    echo -e "${CYAN}Fetching latest Xray-core version...${NC}"
-    # Use direct github api to find latest tag
-    local latest_tag=$(curl -sSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
-        echo -e "${RED}Failed to fetch Xray tag. Try setting up the Installation Proxy (Option 3).${NC}"
-        return 1
+    local download_url="$custom_url"
+    if [[ -z "$download_url" ]]; then
+        echo -e "${CYAN}Fetching latest Xray-core version from GitHub...${NC}"
+        local latest_tag=$(curl -sSL --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+            echo -e "${RED}Failed to fetch tag. Try Option 3 (Proxy) or provide a Custom URL.${NC}"
+            return 1
+        fi
+        download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${X_ARCH}.zip"
     fi
 
-    local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${X_ARCH}.zip"
     echo -e "Downloading Xray from $download_url..."
-
     local download_dir=$(mktemp -d)
-    if curl -sSL -o "$download_dir/xray.zip" "$download_url"; then
+    if curl -L --progress-bar -o "$download_dir/xray.zip" "$download_url"; then
         unzip -q "$download_dir/xray.zip" -d "$XRAY_CORE_DIR"
         chmod +x "$XRAY_BIN"
         rm -rf "$download_dir"
         echo -e "${GREEN}Xray-core installed successfully.${NC}"
     else
         echo -e "${RED}Failed to download Xray-core.${NC}"
+        rm -rf "$download_dir"
         return 1
     fi
+}
+
+install_xray_menu() {
+    clear
+    display_logo
+    echo -e "${CYAN}--- Xray-core Installation ---${NC}"
+    echo -e "1. Download Latest from GitHub"
+    echo -e "2. Download from Custom URL"
+    echo -e "3. Install from Local File (${CONFIG_DIR}/xray.zip)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose method: " "x_inst_choice" 1 4
+    case $x_inst_choice in
+        1) download_xray ;;
+        2)
+           read -p "Enter Custom URL: " curl
+           download_xray "$curl"
+           ;;
+        3)
+           local lzip="${CONFIG_DIR}/xray.zip"
+           if [[ -f "$lzip" ]]; then
+               mkdir -p "$XRAY_CORE_DIR"
+               unzip -q "$lzip" -d "$XRAY_CORE_DIR"
+               chmod +x "$XRAY_BIN"
+               echo -e "${GREEN}Installed from local zip.${NC}"; sleep 1
+           else
+               echo -e "${RED}File $lzip not found!${NC}"; sleep 2
+           fi
+           ;;
+    esac
 }
 
 manage_xray_reality() {
@@ -696,7 +761,7 @@ manage_xray_reality() {
     echo ''
     read_num "Choose an option: " "x_choice" 1 4
     case $x_choice in
-        1) download_xray; sleep 1 ;;
+        1) install_xray_menu ;;
         2) setup_xray_reality "client" ;;
         3) setup_xray_reality "server" ;;
         *) return ;;
@@ -713,7 +778,7 @@ manage_xray_relay() {
     echo ''
     read_num "Choose an option: " "xr_choice" 1 3
     case $xr_choice in
-        1) download_xray; sleep 1 ;;
+        1) install_xray_menu ;;
         2) setup_xray_relay ;;
         *) return ;;
     esac
@@ -925,10 +990,7 @@ SHADOWTLS_SERVICE="iranbax-shadowtls.service"
 SHADOWTLS_BACKEND_SERVICE="iranbax-shadowtls-backend.service"
 
 download_shadowtls() {
-    if [[ -f "$SHADOWTLS_BIN" ]]; then
-        echo -e "${GREEN}ShadowTLS already installed.${NC}"
-        return 0
-    fi
+    local custom_url=$1
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64) S_ARCH="x86_64-unknown-linux-musl" ;;
@@ -936,15 +998,19 @@ download_shadowtls() {
         *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
     esac
 
-    echo -e "${CYAN}Fetching latest ShadowTLS version...${NC}"
-    local download_url=$(curl -sSL https://api.github.com/repos/ihciah/shadow-tls/releases/latest | grep -oP "https://github.com/ihciah/shadow-tls/releases/download/[v\d.]+/shadow-tls-$S_ARCH" | head -n 1)
+    local download_url="$custom_url"
+    if [[ -z "$download_url" ]]; then
+        echo -e "${CYAN}Fetching latest ShadowTLS version from GitHub...${NC}"
+        download_url=$(curl -sSL --max-time 10 https://api.github.com/repos/ihciah/shadow-tls/releases/latest | grep -oP "https://github.com/ihciah/shadow-tls/releases/download/[v\d.]+/shadow-tls-$S_ARCH" | head -n 1)
 
-    if [ -z "$download_url" ]; then
-        echo -e "${RED}Failed to retrieve download URL.${NC}"
-        return 1
+        if [ -z "$download_url" ]; then
+            echo -e "${RED}Failed to fetch tag. Try Option 3 (Proxy) or provide a Custom URL.${NC}"
+            return 1
+        fi
     fi
 
-    if curl -sSL -o "$SHADOWTLS_BIN" "$download_url"; then
+    echo -e "Downloading ShadowTLS from $download_url..."
+    if curl -L --progress-bar -o "$SHADOWTLS_BIN" "$download_url"; then
         chmod +x "$SHADOWTLS_BIN"
         echo -e "${GREEN}ShadowTLS installed successfully.${NC}"
     else
@@ -953,18 +1019,46 @@ download_shadowtls() {
     fi
 }
 
+install_shadowtls_menu() {
+    clear
+    display_logo
+    echo -e "${CYAN}--- ShadowTLS Installation ---${NC}"
+    echo -e "1. Download Latest from GitHub"
+    echo -e "2. Download from Custom URL"
+    echo -e "3. Install from Local File (${CONFIG_DIR}/shadow-tls)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose method: " "s_inst_choice" 1 4
+    case $s_inst_choice in
+        1) download_shadowtls ;;
+        2)
+           read -p "Enter Custom URL: " curl
+           download_shadowtls "$curl"
+           ;;
+        3)
+           local lbin="${CONFIG_DIR}/shadow-tls"
+           if [[ -f "$lbin" ]]; then
+               chmod +x "$lbin"
+               echo -e "${GREEN}Installed from local binary.${NC}"; sleep 1
+           else
+               echo -e "${RED}File $lbin not found!${NC}"; sleep 2
+           fi
+           ;;
+    esac
+}
+
 manage_shadowtls() {
     clear
     display_logo
     echo -e "${MAGENTA}--- ShadowTLS v3 Management (Stealth TCP Wrapper) ---${NC}"
-    echo -e "1. Install ShadowTLS"
+    echo -e "1. Install ShadowTLS binary"
     echo -e "2. Configure IRAN (Client Role)"
     echo -e "3. Configure KHAREJ (Server Role)"
     echo -e "4. Back"
     echo ''
     read_num "Choose an option: " "s_choice" 1 4
     case $s_choice in
-        1) download_shadowtls; sleep 1 ;;
+        1) install_shadowtls_menu ;;
         2) setup_shadowtls "client" ;;
         3) setup_shadowtls "server" ;;
         *) return ;;
