@@ -519,7 +519,7 @@ create_relay_manual() {
                     "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
                     "wsSettings": (if $transport == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
                 }
-            }')
+            } | del(..|nulls)')
     fi
 
     # Fix VMESS security if needed
@@ -600,7 +600,7 @@ parse_vmess_link() {
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
             }
-        }'
+        } | del(..|nulls)'
 }
 
 parse_vless_link() {
@@ -629,6 +629,8 @@ parse_vless_link() {
     local alpn=$(get_p "alpn")
     local insecure=$(get_p "insecure")
     [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
+    local ws_host=$(get_p "host")
+    [[ -z "$ws_host" ]] && ws_host="$sni"
 
     local allow_ins=false
     [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
@@ -644,20 +646,21 @@ parse_vless_link() {
         --arg flow "$flow" \
         --arg fp "${fp:-chrome}" \
         --arg alpn "$alpn" \
+        --arg ws_host "$ws_host" \
         --argjson allow_ins "$allow_ins" \
         '{
             "protocol": "vless",
             "settings": {
-                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "encryption": "none", "flow": $flow}]}]
+                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "encryption": "none", "flow": (if $flow != "" then $flow else null end)}]}]
             },
             "streamSettings": {
                 "network": $type,
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end)
             }
-        }'
+        } | del(..|nulls)'
 }
 
 setup_xray_relay() {
@@ -758,50 +761,59 @@ activate_relay() {
     case $in_proto_choice in
         1)
             # Bridge Mode: Dokodemo-door
-            # We forward to the loopback of the Kharej server on the port specified in config
-            inbound_json="{
-                \"port\": $iran_port,
-                \"protocol\": \"dokodemo-door\",
-                \"settings\": { \"address\": \"127.0.0.1\", \"port\": $remote_port, \"network\": \"tcp,udp\" },
-                \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\", \"quic\"] }
-            }"
+            inbound_json=$(jq -n --argjson p "$iran_port" --argjson rp "$remote_port" '{
+                "port": $p,
+                "protocol": "dokodemo-door",
+                "settings": { "address": "127.0.0.1", "port": $rp, "network": "tcp,udp" },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
+                "tag": "inbound-bridge"
+            }')
             ;;
         2)
             # SOCKS Mode
-            inbound_json="{
-                \"port\": $iran_port,
-                \"protocol\": \"socks\",
-                \"settings\": { \"auth\": \"noauth\", \"udp\": true },
-                \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\", \"quic\"] }
-            }"
+            inbound_json=$(jq -n --argjson p "$iran_port" '{
+                "port": $p,
+                "protocol": "socks",
+                "settings": { "auth": "noauth", "udp": true },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
+                "tag": "inbound-socks"
+            }')
             ;;
         3)
             # Protocol specific
             if [[ "$proto" == "vless" ]]; then
-                inbound_json="{
-                    \"port\": $iran_port,
-                    \"protocol\": \"vless\",
-                    \"settings\": { \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }
-                }"
+                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
+                    "port": $p,
+                    "protocol": "vless",
+                    "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
+                    "tag": "inbound-vless"
+                }')
             elif [[ "$proto" == "vmess" ]]; then
-                inbound_json="{
-                    \"port\": $iran_port,
-                    \"protocol\": \"vmess\",
-                    \"settings\": { \"clients\": [ { \"id\": \"$id\" } ] }
-                }"
+                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
+                    "port": $p,
+                    "protocol": "vmess",
+                    "settings": { "clients": [ { "id": $id } ] },
+                    "tag": "inbound-vmess"
+                }')
             fi
             ;;
     esac
 
-    # Safe JSON assembly using jq to avoid shell expansion issues
+    # Safe JSON assembly using jq
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$outbound" \
         '{
           "log": { "loglevel": "warning" },
           "inbounds": [$inb],
-          "outbounds": [$outb]
-        }' > "$XRAY_RELAY_CONFIG"
+          "outbounds": [($outb | .tag = "outbound-relay")],
+          "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+              { "type": "field", "inboundTag": ["inbound-bridge", "inbound-socks", "inbound-vless", "inbound-vmess"], "outboundTag": "outbound-relay" }
+            ]
+          }
+        } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
@@ -981,49 +993,48 @@ setup_xray_reality() {
         read_port "Enter the port for Xray to listen on (e.g., 443): " "server_port" "true" 443
         read_port "Enter the local port to forward traffic to (v2ray config port on Kharej): " "dest_port" "false" 80
 
-        cat << EOF > "$XRAY_CONFIG"
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $server_port,
-      "protocol": "vless",
-      "settings": {
-        "clients": [ { "id": "$uuid", "flow": "xtls-rprx-vision" } ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "www.google.com:443",
-          "xver": 0,
-          "serverNames": [ "www.google.com" ],
-          "privateKey": "$private_key",
-          "shortIds": [ "$short_id" ]
-        }
-      },
-      "sniffing": { "enabled": true, "destOverride": [ "http", "tls" ] }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    {
-      "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1", "port": $dest_port },
-      "tag": "forward"
-    }
-  ],
-  "routing": {
-    "rules": [ { "type": "field", "inboundTag": [ "inbound-$server_port" ], "outboundTag": "forward" } ]
-  }
-}
-EOF
-        # Note: Added inbound tag and routing to ensure it forwards locally
-        # Simplified routing for this use case:
-        sed -i 's/"inboundTag": \[ "inbound-.*" \]/"port": '$server_port'/g' "$XRAY_CONFIG" # fix routing
-        # Actually simpler to just let it forward via dokodemo if we use it as outbound.
+        jq -n \
+            --argjson p "$server_port" \
+            --arg id "$uuid" \
+            --arg pk "$private_key" \
+            --arg sid "$short_id" \
+            --argjson dp "$dest_port" \
+            '{
+                "log": { "loglevel": "warning" },
+                "inbounds": [
+                    {
+                        "port": $p,
+                        "protocol": "vless",
+                        "settings": {
+                            "clients": [ { "id": $id, "flow": "xtls-rprx-vision" } ],
+                            "decryption": "none"
+                        },
+                        "streamSettings": {
+                            "network": "tcp",
+                            "security": "reality",
+                            "realitySettings": {
+                                "show": false,
+                                "dest": "www.google.com:443",
+                                "xver": 0,
+                                "serverNames": [ "www.google.com" ],
+                                "privateKey": $pk,
+                                "shortIds": [ $sid ]
+                            }
+                        },
+                        "sniffing": { "enabled": true, "destOverride": [ "http", "tls" ] }
+                    }
+                ],
+                "outbounds": [
+                    {
+                        "protocol": "dokodemo-door",
+                        "settings": { "address": "127.0.0.1", "port": $dp },
+                        "tag": "forward"
+                    }
+                ],
+                "routing": {
+                    "rules": [ { "type": "field", "port": $p, "outboundTag": "forward" } ]
+                }
+            }' > "$XRAY_CONFIG"
 
         echo -e "${GREEN}Configuration Generated.${NC}"
         echo -e "${YELLOW}-----------------------------------------${NC}"
@@ -1041,44 +1052,49 @@ EOF
         read -p "Enter Public Key from Kharej: " public_key
         read -p "Enter Short ID from Kharej: " short_id
 
-        cat << EOF > "$XRAY_CONFIG"
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $iran_port,
-      "protocol": "dokodemo-door",
-      "settings": { "address": "$kharej_ip", "port": $kharej_port, "network": "tcp" }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "$kharej_ip",
-            "port": $kharej_port,
-            "users": [ { "id": "$uuid", "encryption": "none", "flow": "xtls-rprx-vision" } ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "fingerprint": "chrome",
-          "serverName": "www.google.com",
-          "publicKey": "$public_key",
-          "shortId": "$short_id",
-          "spiderX": ""
-        }
-      }
-    }
-  ]
-}
-EOF
+        jq -n \
+            --argjson p "$iran_port" \
+            --arg kip "$kharej_ip" \
+            --argjson kp "$kharej_port" \
+            --arg id "$uuid" \
+            --arg pk "$public_key" \
+            --arg sid "$short_id" \
+            '{
+                "log": { "loglevel": "warning" },
+                "inbounds": [
+                    {
+                        "port": $p,
+                        "protocol": "dokodemo-door",
+                        "settings": { "address": $kip, "port": $kp, "network": "tcp" }
+                    }
+                ],
+                "outbounds": [
+                    {
+                        "protocol": "vless",
+                        "settings": {
+                            "vnext": [
+                                {
+                                    "address": $kip,
+                                    "port": $kp,
+                                    "users": [ { "id": $id, "encryption": "none", "flow": "xtls-rprx-vision" } ]
+                                }
+                            ]
+                        },
+                        "streamSettings": {
+                            "network": "tcp",
+                            "security": "reality",
+                            "realitySettings": {
+                                "show": false,
+                                "fingerprint": "chrome",
+                                "serverName": "www.google.com",
+                                "publicKey": $pk,
+                                "shortId": $sid,
+                                "spiderX": ""
+                            }
+                        }
+                    }
+                ]
+            }' > "$XRAY_CONFIG"
     fi
 
     cat << EOF > "/etc/systemd/system/${XRAY_SERVICE}"
