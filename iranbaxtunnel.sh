@@ -303,7 +303,7 @@ display_logo() {
 EOF
     echo -e "${NC}${GREEN}"
     echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
-    echo -e "Version: ${YELLOW}v3.0.0 (Xray Focused)${NC}"
+    echo -e "Version: ${YELLOW}v3.5.0 (Ultimate Edition)${NC}"
 }
 
 # Function to display main menu
@@ -567,12 +567,6 @@ manage_xray_relay() {
 
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
-# URL decode helper
-urldecode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
-}
-
 parse_vmess_link() {
     local link=$1
     local body=$(echo "$link" | sed 's/vmess:\/\///')
@@ -660,7 +654,7 @@ parse_vless_link() {
                     "serverName": $sni,
                     "fingerprint": ($p["fp"] // "chrome"),
                     "allowInsecure": $allow_ins,
-                    "alpn": (if $p["alpn"] != null and $p["alpn"] != "" then ($p["alpn"] | decode | split(",")) else ["h2", "http/1.1"] end)
+                    "alpn": (if $p["alpn"] != null and $p["alpn"] != "" then (decode($p["alpn"]) | split(",")) else ["h2", "http/1.1"] end)
                 } else null end),
                 "realitySettings": (if $sec == "reality" then {
                     "serverName": $sni,
@@ -759,6 +753,8 @@ activate_relay() {
     if [[ ! -f "$config_file" ]]; then echo -e "${RED}Config $name not found!${NC}"; return; fi
 
     local outbound=$(cat "$config_file")
+
+    # Extract necessary info from outbound
     local proto=$(echo "$outbound" | jq -r '.protocol')
     local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.redirect // empty' | cut -d':' -f1)
     local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.redirect // 0' | awk -F':' '{print $NF}')
@@ -770,27 +766,22 @@ activate_relay() {
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    local in_proto_choice=1
-    if [[ "$proto" != "freedom" ]]; then
-        echo -e "\nChoose Entry Protocol for Iran Server:"
-        echo -e "1. Bridge Mode (Simple Forwarding - Use original link on phone)"
-        echo -e "2. SOCKS5 + HTTP Proxy (Use as proxy in Apps/Phone)"
-        echo -e "3. ${proto^^} Relay (UUID Protected - Generate new link for phone)"
-        read_num "Choice (default: 1): " "in_proto_choice" 1 3
-    else
-        echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
-        in_proto_choice=1
-    fi
+    echo -e "\nChoose Entry Protocol for Iran Server:"
+    echo -e "1. Bridge Mode (Standard Tunnel - Best for Panels/Links)"
+    echo -e "2. Protocol Relay (UUID Protected - Generate new link)"
+    echo -e "3. SOCKS5 Proxy"
+    read_num "Choice (default: 1): " "in_proto_choice" 1 3
     in_proto_choice=${in_proto_choice:-1}
 
-    local final_json=""
+    local final_config=""
     case $in_proto_choice in
         1)
-            # Bridge Mode: If config is encrypted, we must just forward RAW bits
-            if [[ "$security" != "none" || "$transport" != "tcp" ]]; then
-                echo -e "${YELLOW}Detected encrypted/complex tunnel. Using Simple Transparent Bridge.${NC}"
-                final_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '
-                {
+            # Bridge Mode: Universal Forwarding
+            final_config=$(jq -n \
+                --argjson p "$iran_port" \
+                --arg addr "$remote_addr" \
+                --argjson rp "$remote_port" \
+                '{
                     "log": { "loglevel": "warning" },
                     "inbounds": [{
                         "port": $p,
@@ -799,59 +790,57 @@ activate_relay() {
                     }],
                     "outbounds": [{ "protocol": "freedom" }]
                 }')
-            else
-                # Plain TCP config, we can use the outbound as-is
-                final_json=$(jq -n --argjson p "$iran_port" --argjson outb "$outbound" '
-                {
+            ;;
+        2)
+            # Protocol Relay: Re-encapsulate
+            final_config=$(jq -n \
+                --argjson p "$iran_port" \
+                --arg pr "$proto" \
+                --arg id "$uuid" \
+                --argjson outb "$outbound" \
+                '{
                     "log": { "loglevel": "warning" },
                     "inbounds": [{
                         "port": $p,
-                        "protocol": "dokodemo-door",
-                        "settings": { "address": "127.0.0.1", "port": 0, "network": "tcp,udp" },
+                        "protocol": $pr,
+                        "settings": {
+                            "clients": [ { "id": $id } ],
+                            "decryption": (if $pr == "vless" then "none" else null end)
+                        },
                         "tag": "in"
                     }],
                     "outbounds": [($outb | .tag = "out")],
                     "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
                 }')
-            fi
-            ;;
-        2)
-            # SOCKS Mode
-            final_json=$(jq -n --argjson p "$iran_port" --argjson outb "$outbound" '
-            {
-                "log": { "loglevel": "warning" },
-                "inbounds": [{
-                    "port": $p,
-                    "protocol": "socks",
-                    "settings": { "auth": "noauth", "udp": true },
-                    "tag": "in"
-                }],
-                "outbounds": [($outb | .tag = "out")],
-                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
-            }')
             ;;
         3)
-            # Protocol specific Relay
-            local inbound_proto="$proto"
-            local inbound_settings="{ \"clients\": [ { \"id\": \"$id\" } ] }"
-            [[ "$proto" == "vless" ]] && inbound_settings="{ \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }"
-
-            final_json=$(jq -n --argjson p "$iran_port" --arg pr "$inbound_proto" --argjson ps "$inbound_settings" --argjson outb "$outbound" '
-            {
-                "log": { "loglevel": "warning" },
-                "inbounds": [{
-                    "port": $p,
-                    "protocol": $pr,
-                    "settings": $ps,
-                    "tag": "in"
-                }],
-                "outbounds": [($outb | .tag = "out")],
-                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
-            }')
+            # SOCKS Mode
+            final_config=$(jq -n \
+                --argjson p "$iran_port" \
+                --argjson outb "$outbound" \
+                '{
+                    "log": { "loglevel": "warning" },
+                    "inbounds": [{
+                        "port": $p,
+                        "protocol": "socks",
+                        "settings": { "auth": "noauth", "udp": true },
+                        "tag": "in"
+                    }],
+                    "outbounds": [($outb | .tag = "out")],
+                    "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
+                }')
             ;;
     esac
 
-    echo "$final_json" | jq 'del(..|nulls)' > "$XRAY_RELAY_CONFIG"
+    if [[ -z "$final_config" ]]; then
+        echo -e "${RED}Error: Configuration generation failed.${NC}"
+        return
+    fi
+
+    echo "$final_config" | jq 'del(..|nulls)' > "$XRAY_RELAY_CONFIG" || {
+        echo -e "${RED}Error: Failed to write config file.${NC}"
+        return
+    }
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
@@ -878,6 +867,15 @@ EOF
     fi
 
     stop_conflicting_service "$iran_port"
+
+    echo -e "${CYAN}Testing Xray configuration...${NC}"
+    if ! "$XRAY_BIN" test -c "$XRAY_RELAY_CONFIG" > /tmp/xray_test.log 2>&1; then
+        echo -e "${RED}Xray configuration test failed!${NC}"
+        cat /tmp/xray_test.log
+        return
+    fi
+    echo -e "${GREEN}Configuration valid.${NC}"
+
     systemctl daemon-reload
     systemctl enable "$XRAY_RELAY_SERVICE"
     systemctl restart "$XRAY_RELAY_SERVICE"
@@ -915,16 +913,16 @@ EOF
         local test_cmd="curl -L --connect-timeout 5 -s -o /dev/null -w \"%{http_code}\""
         local fetch_ok=false
 
-        if [[ "$in_proto_choice" == "1" ]]; then
+        if [[ "$in_proto_choice" == "3" ]]; then
             # Test via SOCKS5
             if [[ $($test_cmd --proxy socks5h://127.0.0.1:$iran_port http://www.google.com/generate_204) == "204" ]]; then
                 fetch_ok=true
             fi
         else
-            # For VLESS/VMESS, we can't easily test with curl without a client,
-            # so we check if the port is at least listening and responding
+            # For Bridge or Protocol Relay, we can only check if the port is listening
             if ss -tulnp | grep -q ":$iran_port "; then
-                echo -e "${YELLOW}[!] Protocol-specific relay is listening. Connect your V2ray client to verify.${NC}"
+                echo -e "${GREEN}[✔] Port $iran_port is listening and tunnel is active.${NC}"
+                echo -e "${YELLOW}Please test with your V2ray client to confirm end-to-end connectivity.${NC}"
                 sleep 2
                 return
             fi
@@ -1468,6 +1466,10 @@ check_status() {
 restart_all() {
     echo -e "${YELLOW}Restarting all services...${NC}"
     systemctl restart "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
+    local ssh_services=$(ls /etc/systemd/system/iranbax-ssh-*.service 2>/dev/null)
+    for s in $ssh_services; do
+        systemctl restart "$(basename "$s")" 2>/dev/null
+    done
     echo -e "${GREEN}Done.${NC}"
     sleep 1
 }
