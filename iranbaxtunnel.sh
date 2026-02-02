@@ -550,65 +550,72 @@ parse_vmess_link() {
     local uuid=$(echo "$decoded" | jq -r '.id')
     local host=$(echo "$decoded" | jq -r '.add')
     local port=$(echo "$decoded" | jq -r '.port')
-    local security=$(echo "$decoded" | jq -r '.scy // "auto"')
+    local aid=$(echo "$decoded" | jq -r '.aid // 0')
     local net_type=$(echo "$decoded" | jq -r '.net')
-    local path=$(echo "$decoded" | jq -r '.path')
+    local path=$(echo "$decoded" | jq -r '.path // "/"')
     local sni=$(echo "$decoded" | jq -r '.sni // .host')
     local tls_type=$(echo "$decoded" | jq -r '.tls')
+    local security=$(echo "$decoded" | jq -r '.scy // "auto"')
 
     jq -n \
         --arg uuid "$uuid" \
         --arg host "$host" \
         --arg port "$port" \
-        --arg security "$security" \
-        --arg sni "$sni" \
-        --arg net_type "$net_type" \
+        --argjson aid "$aid" \
+        --arg net "$net_type" \
         --arg path "$path" \
-        --arg tls_type "$tls_type" \
+        --arg sni "$sni" \
+        --arg tls "$tls_type" \
+        --arg scy "$security" \
         '{
             "protocol": "vmess",
             "settings": {
-                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "security": $security}]}]
+                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "alterId": $aid, "security": $scy}]}]
             },
             "streamSettings": {
-                "network": $net_type,
-                "security": (if $tls_type == "tls" then "tls" else "none" end),
-                "tlsSettings": (if $tls_type == "tls" then {"serverName": $sni} else null end),
-                "wsSettings": (if $net_type == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+                "network": $net,
+                "security": (if $tls == "tls" then "tls" else "none" end),
+                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true} else null end),
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
             }
         }'
 }
 
 parse_vless_link() {
     local link=$1
-    # Very basic parser for vless://uuid@host:port?params#tag
+    # Basic robust parser for vless://uuid@host:port?params#tag
     local body=$(echo "$link" | sed 's/vless:\/\///')
-    local tag=$(echo "$body" | grep -o '#.*' | sed 's/#//')
-    local rest=$(echo "$body" | sed 's/#.*//')
-    local uuid=$(echo "$rest" | awk -F'@' '{print $1}')
-    local host_port_params=$(echo "$rest" | awk -F'@' '{print $2}')
-    local host_port=$(echo "$host_port_params" | awk -F'?' '{print $1}')
-    local params=$(echo "$host_port_params" | awk -F'?' '{print $2}')
+    local uuid=$(echo "$body" | awk -F'@' '{print $1}')
+    local rest=$(echo "$body" | awk -F'@' '{print $2}')
+    local host_port=$(echo "$rest" | awk -F'?' '{print $1}')
+    local params=$(echo "$rest" | awk -F'?' '{print $2}' | awk -F'#' '{print $1}')
     local host=$(echo "$host_port" | awk -F':' '{print $1}')
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
 
-    # Extract common params
-    local security=$(echo "$params" | grep -o 'security=[^&]*' | cut -d'=' -f2)
-    local sni=$(echo "$params" | grep -o 'sni=[^&]*' | cut -d'=' -f2)
-    [[ -z "$sni" ]] && sni=$(echo "$params" | grep -o 'peer=[^&]*' | cut -d'=' -f2)
-    local type=$(echo "$params" | grep -o 'type=[^&]*' | cut -d'=' -f2)
-    local path=$(echo "$params" | grep -o 'path=[^&]*' | cut -d'=' -f2 | sed 's/%2F/\//g')
-    local flow=$(echo "$params" | grep -o 'flow=[^&]*' | cut -d'=' -f2)
+    # Function to extract param value
+    get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g'; }
+
+    local type=$(get_p "type")
+    local security=$(get_p "security")
+    local sni=$(get_p "sni")
+    [[ -z "$sni" ]] && sni=$(get_p "peer")
+    [[ -z "$sni" ]] && sni=$(get_p "host")
+    local path=$(get_p "path")
+    local flow=$(get_p "flow")
+    local fp=$(get_p "fp")
+    local alpn=$(get_p "alpn")
 
     jq -n \
         --arg uuid "$uuid" \
         --arg host "$host" \
         --arg port "$port" \
+        --arg type "${type:-tcp}" \
         --arg security "${security:-none}" \
         --arg sni "$sni" \
-        --arg type "${type:-tcp}" \
-        --arg path "$path" \
+        --arg path "${path:-/}" \
         --arg flow "$flow" \
+        --arg fp "${fp:-chrome}" \
+        --arg alpn "$alpn" \
         '{
             "protocol": "vless",
             "settings": {
@@ -617,9 +624,9 @@ parse_vless_link() {
             "streamSettings": {
                 "network": $type,
                 "security": $security,
-                "tlsSettings": (if $security == "tls" then {"serverName": $sni} else null end),
-                "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path} else null end)
+                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
+                "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
             }
         }'
 }
@@ -700,40 +707,56 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
+    local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // 0')
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
     echo -e "\nChoose Entry Protocol for Iran Server:"
-    echo -e "1. SOCKS5 + HTTP (Most compatible, use as Proxy)"
-    echo -e "2. ${proto^^} (Relay mode, use with V2ray client)"
-    read_num "Choice (default: 1): " "in_proto_choice" 1 2
+    echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels)"
+    echo -e "2. SOCKS5 + HTTP Proxy"
+    echo -e "3. ${proto^^} Relay (UUID validation enabled)"
+    read_num "Choice (default: 1): " "in_proto_choice" 1 3
     in_proto_choice=${in_proto_choice:-1}
 
     local inbound_json=""
-    if [[ "$in_proto_choice" == "1" ]]; then
-        inbound_json="{
-            \"port\": $iran_port,
-            \"protocol\": \"socks\",
-            \"settings\": { \"auth\": \"noauth\", \"udp\": true },
-            \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\"] }
-        }"
-    else
-        # Match outbound protocol for seamless relaying
-        if [[ "$proto" == "vless" ]]; then
+    case $in_proto_choice in
+        1)
+            # Bridge Mode: Dokodemo-door
+            # We forward to the loopback of the Kharej server on the port specified in config
             inbound_json="{
                 \"port\": $iran_port,
-                \"protocol\": \"vless\",
-                \"settings\": { \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }
+                \"protocol\": \"dokodemo-door\",
+                \"settings\": { \"address\": \"127.0.0.1\", \"port\": $remote_port, \"network\": \"tcp,udp\" },
+                \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\", \"quic\"] }
             }"
-        else
+            ;;
+        2)
+            # SOCKS Mode
             inbound_json="{
                 \"port\": $iran_port,
-                \"protocol\": \"vmess\",
-                \"settings\": { \"clients\": [ { \"id\": \"$id\" } ] }
+                \"protocol\": \"socks\",
+                \"settings\": { \"auth\": \"noauth\", \"udp\": true },
+                \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\", \"quic\"] }
             }"
-        fi
-    fi
+            ;;
+        3)
+            # Protocol specific
+            if [[ "$proto" == "vless" ]]; then
+                inbound_json="{
+                    \"port\": $iran_port,
+                    \"protocol\": \"vless\",
+                    \"settings\": { \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }
+                }"
+            else
+                inbound_json="{
+                    \"port\": $iran_port,
+                    \"protocol\": \"vmess\",
+                    \"settings\": { \"clients\": [ { \"id\": \"$id\" } ] }
+                }"
+            fi
+            ;;
+    esac
 
     cat << EOF > "$XRAY_RELAY_CONFIG"
 {
