@@ -26,13 +26,9 @@ SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
 # Service names for cleanup/reference
 XRAY_SERVICE="iranbax-xray.service"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
-SHADOWTLS_SERVICE="iranbax-shadowtls.service"
-SHADOWTLS_BACKEND_SERVICE="iranbax-shadowtls-backend.service"
-ICMP_SERVICE="iranbax-icmp.service"
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Ensure directories exist
 mkdir -p "$CONFIG_DIR" "$SAVED_RELAYS_DIR"
-fi
 
 # --- Input Validation Logic ---
 
@@ -263,16 +259,16 @@ display_topbar() {
 display_logo() {
     echo -e "${CYAN}"
     cat << "EOF"
-               __  .__           .__
-____________ _/  |_|  |__   ____ |  |   ____
-\_  __ \__  \\   __|  |  \ /  _ \|  | _/ __ \
- |  | \// __ \|  | |   Y  (  <_> |  |_\  ___/
- |__|  (____  |__| |___|  /\____/|____/\___  >
-            \/          \/                 \/
+  _____                 _
+ |_   _|               | |
+   | |  _ __ __ _ _ __ | |__   __ ___  __
+   | | | '__/ _` | '_ \| '_ \ / _` \ \/ /
+  _| |_| | | (_| | | | | |_) | (_| |>  <
+ |_____|_|  \__,_|_| |_|_.__/ \__,_/_/\_\
 EOF
     echo -e "${NC}${GREEN}"
     echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
-    echo -e "Version: ${YELLOW}v2.2.0 (Xray Focused)${NC}"
+    echo -e "Version: ${YELLOW}v3.0.0 (Xray Focused)${NC}"
 }
 
 # Function to display main menu
@@ -409,21 +405,112 @@ manage_xray_reality() {
     esac
 }
 
+create_relay_manual() {
+    clear
+    display_logo
+    echo -e "${CYAN}--- Create New Xray Relay Config (Manual) ---${NC}"
+
+    read -p "Enter a name for this config: " relay_name
+    relay_name=$(echo "$relay_name" | sed 's/[^a-zA-Z0-9_]/_/g')
+    [[ -z "$relay_name" ]] && { echo -e "${RED}Name cannot be empty.${NC}"; sleep 1; return; }
+
+    read_ip "Enter Remote (Kharej) IP/Address: " "rem_addr"
+    read_port "Enter Remote Port: " "rem_port" "false"
+
+    echo -e "Choose Protocol:"
+    echo "1. VLESS"
+    echo "2. VMESS"
+    read_num "Choice: " "proto_choice" 1 2
+    local proto="vless"
+    [[ $proto_choice -eq 2 ]] && proto="vmess"
+
+    read -p "Enter UUID: " uuid
+    [[ -z "$uuid" ]] && { echo -e "${RED}UUID cannot be empty.${NC}"; sleep 1; return; }
+
+    echo -e "Choose Transport:"
+    echo "1. TCP"
+    echo "2. WebSocket (WS)"
+    read_num "Choice: " "trans_choice" 1 2
+    local transport="tcp"
+    [[ $trans_choice -eq 2 ]] && transport="ws"
+
+    local path=""
+    if [[ "$transport" == "ws" ]]; then
+        read -p "Enter WS Path (default: /): " path
+        path=${path:-/}
+    fi
+
+    echo -e "Choose Security:"
+    echo "1. None"
+    echo "2. TLS"
+    echo "3. Reality"
+    read_num "Choice: " "sec_choice" 1 3
+    local security="none"
+    [[ $sec_choice -eq 2 ]] && security="tls"
+    [[ $sec_choice -eq 3 ]] && security="reality"
+
+    local sni=""
+    if [[ "$security" != "none" ]]; then
+        read -p "Enter SNI / ServerName: " sni
+    fi
+
+    # Build the outbound JSON using jq
+    local outbound=$(jq -n \
+        --arg proto "$proto" \
+        --arg addr "$rem_addr" \
+        --argjson port "$rem_port" \
+        --arg uuid "$uuid" \
+        --arg transport "$transport" \
+        --arg security "$security" \
+        --arg sni "$sni" \
+        --arg path "$path" \
+        '{
+            "protocol": $proto,
+            "settings": {
+                "vnext": [{"address": $addr, "port": $port, "users": [{"id": $uuid, "encryption": "none"}]}]
+            },
+            "streamSettings": {
+                "network": $transport,
+                "security": $security,
+                "tlsSettings": (if $security == "tls" then {"serverName": $sni} else null end),
+                "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
+                "wsSettings": (if $transport == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+            }
+        }')
+
+    # Fix VMESS security if needed
+    if [[ "$proto" == "vmess" ]]; then
+        outbound=$(echo "$outbound" | jq '.settings.vnext[0].users[0].security = "auto" | del(.settings.vnext[0].users[0].encryption)')
+    fi
+
+    echo "$outbound" > "${SAVED_RELAYS_DIR}/${relay_name}.json"
+    echo -e "${GREEN}Config saved as ${relay_name}.json${NC}"
+    sleep 1
+
+    read -p "Do you want to connect to this relay now? (y/n, default: y): " connect_now
+    connect_now=${connect_now:-y}
+    if [[ "$connect_now" == "y" ]]; then
+        activate_relay "$relay_name"
+    fi
+}
+
 manage_xray_relay() {
     while true; do
         clear
         display_logo
-        echo -e "${CYAN}--- Xray Relay Management (Import V2ray) ---${NC}"
-        echo -e "1. Install Xray-core"
-        echo -e "2. Import New Relay (JSON or Link)"
+        echo -e "${CYAN}--- Xray Relay Management ---${NC}"
+        echo -e "1. Create New Config (Manual)"
+        echo -e "2. Import New Config (JSON or Link)"
         echo -e "3. Saved Relays (List, Connect, Edit, Delete)"
-        echo -e "4. Back"
+        echo -e "4. Install Xray-core"
+        echo -e "5. Back"
         echo ''
-        read_num "Choose an option: " "xr_choice" 1 4
+        read_num "Choose an option: " "xr_choice" 1 5
         case $xr_choice in
-            1) install_xray_menu ;;
+            1) create_relay_manual ;;
             2) setup_xray_relay ;;
             3) saved_relays_menu ;;
+            4) install_xray_menu ;;
             *) return ;;
         esac
     done
@@ -618,6 +705,14 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
+    read -p "Apply changes and restart Xray Relay now? (y/n, default: y): " apply_now
+    apply_now=${apply_now:-y}
+    if [[ "$apply_now" != "y" ]]; then
+        echo -e "${YELLOW}Changes saved but not applied. Service not restarted.${NC}"
+        sleep 2
+        return
+    fi
+
     systemctl daemon-reload
     systemctl enable "$XRAY_RELAY_SERVICE"
     systemctl restart "$XRAY_RELAY_SERVICE"
@@ -732,6 +827,12 @@ edit_relay() {
             fi
             ;;
     esac
+
+    read -p "Do you want to apply these changes and restart the relay now? (y/n, default: y): " apply_edit
+    apply_edit=${apply_edit:-y}
+    if [[ "$apply_edit" == "y" ]]; then
+        activate_relay "$name"
+    fi
 }
 
 setup_xray_reality() {
@@ -1103,28 +1204,15 @@ cleanup_all() {
 
     # Stop all services
     echo -e "${YELLOW}Stopping all tunnel services...${NC}"
-    systemctl stop "rathole-*" "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" "$ICMP_SERVICE" "ssh-tunnel-*" 2>/dev/null
-    systemctl disable "rathole-*" "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" "$ICMP_SERVICE" "ssh-tunnel-*" 2>/dev/null
+    systemctl stop "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
+    systemctl disable "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
 
     # Remove systemd files
-    rm -f /etc/systemd/system/rathole-*.service
-    rm -f /etc/systemd/system/ssh-tunnel-*.service
     rm -f "/etc/systemd/system/${XRAY_SERVICE}" "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
-    rm -f "/etc/systemd/system/${SHADOWTLS_SERVICE}" "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
-    rm -f "/etc/systemd/system/${ICMP_SERVICE}"
-
-    # SIT/GRE cleanup
-    ip tunnel del "gre1" 2>/dev/null
-    ip tunnel del "tun6to4" 2>/dev/null
-    iptables -t nat -S | grep "tunnel_wizard" | sed 's/-A/-D/' | while read line; do iptables -t nat $line 2>/dev/null; done
-    ip rule del from 172.16.0.0/30 table 4 2>/dev/null
-    ip route flush table 4 2>/dev/null
 
     # Remove ACTIVE config files but NOT the whole directory or zip/relays
     echo -e "${YELLOW}Removing active configuration files...${NC}"
     rm -f "${CONFIG_DIR}/xray_config.json" "${CONFIG_DIR}/xray_relay.json"
-    rm -f "${CONFIG_DIR}/rathole_server.toml" "${CONFIG_DIR}/rathole_client_s"*.toml
-    rm -f "${CONFIG_DIR}/shadowtls_backend.json" "${CONFIG_DIR}/shadowtls_client.json"
 
     # Proxies
     clear_proxy
@@ -1148,8 +1236,7 @@ check_status() {
 
 restart_all() {
     echo -e "${YELLOW}Restarting all services...${NC}"
-    systemctl restart "rathole-*" 2>/dev/null
-    systemctl restart "ssh-tunnel-*" 2>/dev/null
+    systemctl restart "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
     echo -e "${GREEN}Done.${NC}"
     sleep 1
 }
@@ -1157,7 +1244,7 @@ restart_all() {
 update_script() {
     echo -e "${CYAN}Updating script...${NC}"
     # Target URL for updates
-    local script_url="https://raw.githubusercontent.com/Musixal/rathole-tunnel/main/iranbaxtunnel.sh"
+    local script_url="https://raw.githubusercontent.com/Musixal/iranbaxtunnel/main/iranbaxtunnel.sh"
     local temp_file="/tmp/iranbaxtunnel_new.sh"
 
     echo -e "Downloading latest version from ${script_url}..."
