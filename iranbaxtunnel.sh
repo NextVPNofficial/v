@@ -104,10 +104,18 @@ read_port() {
         if is_valid_port "$input"; then
             if [[ "$check_usage" == "true" ]]; then
                 if check_port_in_use "$input"; then
-                    echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
-                    ss -tulnp | grep ":${input} "
-                    flush_stdin
-                    continue
+                    local p_info=$(ss -tulnp | grep ":${input} " | head -n1)
+                    if echo "$p_info" | grep -iq "xray"; then
+                        echo -e "${YELLOW}Warning: Port $input is currently used by Xray. It will be replaced.${NC}"
+                    else
+                        echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
+                        echo "$p_info"
+                        read -p "Do you want to use this port anyway? (y/n, default: n): " force_port
+                        if [[ "$force_port" != "y" ]]; then
+                            flush_stdin
+                            continue
+                        fi
+                    fi
                 fi
             fi
             eval "$var_name=\"$input\""
@@ -280,7 +288,7 @@ display_menu() {
     echo -e "${CYAN}1. Xray Relay Management (V2ray Config/Link)${NC}"
     echo -e "${MAGENTA}2. Xray-Reality Management (Stealth TCP)${NC}"
     echo -e "${YELLOW}3. Service & System Management (Optimizations, Restarts)${NC}"
-    echo -e "${GREEN}4. Installation Proxy (SSH Reverse for Setup)${NC}"
+    echo -e "${GREEN}4. Installation Proxy (Setup Helper)${NC}"
     echo -e "${RED}5. Remove All Tunnels & Cleanup${NC}"
     echo -e "6. Update Script"
     echo -e "0. Exit"
@@ -483,15 +491,12 @@ create_relay_manual() {
         outbound=$(echo "$outbound" | jq '.settings.vnext[0].users[0].security = "auto" | del(.settings.vnext[0].users[0].encryption)')
     fi
 
+    mkdir -p "$SAVED_RELAYS_DIR"
     echo "$outbound" > "${SAVED_RELAYS_DIR}/${relay_name}.json"
     echo -e "${GREEN}Config saved as ${relay_name}.json${NC}"
     sleep 1
 
-    read -p "Do you want to connect to this relay now? (y/n, default: y): " connect_now
-    connect_now=${connect_now:-y}
-    if [[ "$connect_now" == "y" ]]; then
-        activate_relay "$relay_name"
-    fi
+    activate_relay "$relay_name"
 }
 
 manage_xray_relay() {
@@ -654,14 +659,12 @@ setup_xray_relay() {
     relay_name=${relay_name:-$random_name}
     relay_name=$(echo "$relay_name" | sed 's/[^a-zA-Z0-9_]/_/g')
 
+    mkdir -p "$SAVED_RELAYS_DIR"
     echo "$outbound" > "${SAVED_RELAYS_DIR}/${relay_name}.json"
     echo -e "${GREEN}Saved as $relay_name!${NC}"
     sleep 1
 
-    read -p "Do you want to connect to this relay now? (y/n): " connect_now
-    if [[ "$connect_now" == "y" ]]; then
-        activate_relay "$relay_name"
-    fi
+    activate_relay "$relay_name"
 }
 
 activate_relay() {
@@ -828,11 +831,7 @@ edit_relay() {
             ;;
     esac
 
-    read -p "Do you want to apply these changes and restart the relay now? (y/n, default: y): " apply_edit
-    apply_edit=${apply_edit:-y}
-    if [[ "$apply_edit" == "y" ]]; then
-        activate_relay "$name"
-    fi
+    activate_relay "$name"
 }
 
 setup_xray_reality() {
@@ -972,22 +971,22 @@ EOF
     sleep 2
 }
 
-setup_ssh_keys() {
+setup_proxy_keys() {
     local target_ip=$1
-    local ssh_user=$2
-    local ssh_port=$3
+    local user=$2
+    local port=$3
 
     if [[ ! -f "$HOME/.ssh/id_rsa" ]]; then
-        echo -e "${YELLOW}SSH Key not found. Generating...${NC}"
+        echo -e "${YELLOW}Auth key not found. Generating...${NC}"
         ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/id_rsa" -N ""
     fi
 
-    echo -e "${CYAN}Copying SSH key to target server... you may be prompted for password.${NC}"
-    ssh-copy-id -o StrictHostKeyChecking=no -p "$ssh_port" "${ssh_user}@${target_ip}"
+    echo -e "${CYAN}Copying auth key to target server... you may be prompted for password.${NC}"
+    ssh-copy-id -o StrictHostKeyChecking=no -p "$port" "${user}@${target_ip}"
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}SSH Key copied successfully! Tunnel will now work without password.${NC}"
+        echo -e "${GREEN}Auth key copied successfully!${NC}"
     else
-        echo -e "${RED}Failed to copy SSH key.${NC}"
+        echo -e "${RED}Failed to copy auth key.${NC}"
     fi
 }
 
@@ -1100,11 +1099,11 @@ connect_installation_proxy() {
     local port=$3
 
     echo ''
-    read -p "Do you want to setup SSH Keys first? (y/n): " setup_keys
-    [[ "$setup_keys" == "y" ]] && setup_ssh_keys "$ip" "$user" "$port"
+    read -p "Do you want to setup Auth Keys first? (y/n): " setup_keys
+    [[ "$setup_keys" == "y" ]] && setup_proxy_keys "$ip" "$user" "$port"
 
-    echo -e "${CYAN}Establishing SSH tunnel...${NC}"
-    # Start SSH Dynamic Forwarding in background
+    echo -e "${CYAN}Establishing setup proxy...${NC}"
+    # Start Dynamic Forwarding in background
     ssh -D 1080 -C -N -f -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${user}@${ip}"
 
     if [ $? -eq 0 ]; then
@@ -1114,7 +1113,7 @@ connect_installation_proxy() {
         echo -e "${GREEN}Proxy established! http_proxy/https_proxy set to socks5h://127.0.0.1:1080${NC}"
         save_proxy "$ip" "$user" "$port"
     else
-        echo -e "${RED}Failed to establish SSH tunnel.${NC}"
+        echo -e "${RED}Failed to establish setup proxy.${NC}"
     fi
     sleep 2
 }
@@ -1126,7 +1125,7 @@ installation_proxy() {
         echo -e "${YELLOW}--- Installation Proxy Settings ---${NC}"
         echo -e "This helps if your server (Iran) cannot reach GitHub or foreign sites."
         echo ''
-        echo -e "1. New SSH SOCKS5 Proxy"
+        echo -e "1. New SOCKS5 Setup Proxy"
         echo -e "2. Use a Saved Proxy"
         echo -e "3. Manage Saved Proxies (Delete)"
         echo -e "4. Clear Active Proxy Settings"
@@ -1137,9 +1136,9 @@ installation_proxy() {
         case $proxy_choice in
             1)
                 read_ip "Enter Foreign Server IP: " "proxy_ip"
-                read -p "Enter SSH Username (default: root): " proxy_user
+                read -p "Enter Username (default: root): " proxy_user
                 proxy_user=${proxy_user:-root}
-                read_port "Enter SSH Port (default: 22): " "proxy_port" "false" 22
+                read_port "Enter Port (default: 22): " "proxy_port" "false" 22
                 connect_installation_proxy "$proxy_ip" "$proxy_user" "$proxy_port"
                 ;;
             2)
