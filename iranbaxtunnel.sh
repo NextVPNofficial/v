@@ -47,6 +47,16 @@ is_valid_ip() {
     fi
 }
 
+# Function to check if a port is in use
+check_port_in_use() {
+    local port=$1
+    if ss -tulnp | grep -q ":${port} " ; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Function to validate port
 is_valid_port() {
     local port=$1
@@ -77,10 +87,23 @@ read_ip() {
 read_port() {
     local prompt=$1
     local var_name=$2
+    local check_usage=$3
+    local default_val=$4
     local input
     while true; do
         read -p "$prompt" input
+        if [[ -z "$input" && -n "$default_val" ]]; then
+            input="$default_val"
+        fi
         if is_valid_port "$input"; then
+            if [[ "$check_usage" == "true" ]]; then
+                if check_port_in_use "$input"; then
+                    echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
+                    ss -tulnp | grep ":${input} "
+                    flush_stdin
+                    continue
+                fi
+            fi
             eval "$var_name=\"$input\""
             break
         else
@@ -144,6 +167,19 @@ ensure_deps
 fi
 
 # --- Status Topbar Logic ---
+
+get_public_ip() {
+    local ip
+    if pgrep -f "ssh -D 1080" > /dev/null; then
+        # Try fetching via proxy
+        ip=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 2 https://ifconfig.me 2>/dev/null)
+    fi
+    if [[ -z "$ip" ]]; then
+        # Try direct fetch
+        ip=$(curl -s --max-time 2 https://ifconfig.me 2>/dev/null)
+    fi
+    echo "${ip:-Unknown}"
+}
 
 get_tunnel_status() {
     local status_line=""
@@ -211,8 +247,10 @@ get_proxy_status() {
 }
 
 display_topbar() {
+    local current_ip=$(get_public_ip)
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -n -e "${BLUE}║${NC} ${YELLOW}Tunnels:${NC} "
+    echo -e "${BLUE}║${NC} ${YELLOW}System Exit IP:${NC} ${CYAN}${current_ip}${NC}"
+    echo -n -e "${BLUE}║${NC} ${YELLOW}Active Tunnels:${NC} "
     get_tunnel_status
     echo -e "${BLUE}║${NC} ${YELLOW}Installation Proxy:${NC} $(get_proxy_status)"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
@@ -371,12 +409,12 @@ rathole_iran_config() {
     if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
     clear
     echo -e "${YELLOW}Configuring IRAN server for Rathole...${NC}"
-    read_port "Enter the tunnel port (the port Rathole listens on): " "tunnel_port"
+    read_port "Enter the tunnel port (the port Rathole listens on): " "tunnel_port" "true"
     read_num "Enter number of services/ports to tunnel: " "num_ports" 1 100
 
     ports=()
     for ((i=1; i<=$num_ports; i++)); do
-        read_port "Enter Service Port $i: " "p"
+        read_port "Enter Service Port $i: " "p" "true"
         ports+=("$p")
     done
 
@@ -450,12 +488,13 @@ rathole_kharej_config() {
     for ((j=1; j<=$server_num; j++)); do
         echo -e "${YELLOW}Server $j:${NC}"
         read_ip "  Enter IRAN Server IP: " "iran_ip"
-        read_port "  Enter IRAN Tunnel Port: " "tunnel_port"
+        read_port "  Enter IRAN Tunnel Port: " "tunnel_port" "false"
         read_num "  Enter number of services: " "num_ports" 1 100
 
         ports=()
         for ((i=1; i<=$num_ports; i++)); do
-            read_port "    Enter Local Port $i: " "p"
+            # Local ports on Kharej don't necessarily need to be checked for usage in the same way, but it's good practice
+            read_port "    Enter Local Port $i: " "p" "true"
             ports+=("$p")
         done
 
@@ -661,10 +700,9 @@ setup_ssh_traffic() {
     read_ip "Enter Target Server IP: " "target_ip"
     read -p "Enter SSH Username (default: root): " ssh_user
     ssh_user=${ssh_user:-root}
-    read_port "Enter SSH Port (default: 22): " "ssh_port"
-    ssh_port=${ssh_port:-22}
-    read_port "Enter IRAN Port to listen on: " "iran_port"
-    read_port "Enter KHAREJ Port to connect to: " "kharej_port"
+    read_port "Enter SSH Port (default: 22): " "ssh_port" "false" 22
+    read_port "Enter IRAN Port to listen on: " "iran_port" "true"
+    read_port "Enter KHAREJ Port to connect to: " "kharej_port" "false"
 
     echo -e "${YELLOW}Establishing persistent SSH tunnel via Systemd...${NC}"
     echo -e "${CYAN}Note: It's highly recommended to setup SSH Keys for passwordless access.${NC}"
@@ -672,12 +710,15 @@ setup_ssh_traffic() {
     local service_name="ssh-tunnel-${iran_port}.service"
     local ssh_cmd=""
 
+    local common_opts="-C -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes"
+
     if [[ "$type" == "local" ]]; then
-        # Local: Iran listens on iran_port and forwards to Kharej:kharej_port
-        ssh_cmd="ssh -N -L 0.0.0.0:${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
+        # Local: Current server listens on iran_port and forwards to target_ip:kharej_port
+        ssh_cmd="ssh ${common_opts} -L 0.0.0.0:${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
     else
-        # Remote: Iran listens on iran_port and traffic goes to Kharej:kharej_port (command run on Kharej)
-        ssh_cmd="ssh -N -R ${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
+        # Remote: Current server connects to target_ip and opens iran_port ON target_ip
+        ssh_cmd="ssh ${common_opts} -R 0.0.0.0:${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
+        echo -e "${YELLOW}Note: Remote forwarding requires 'GatewayPorts yes' in the target server's sshd_config.${NC}"
     fi
 
     cat << EOF > "/etc/systemd/system/${service_name}"
@@ -690,6 +731,7 @@ Type=simple
 ExecStart=${ssh_cmd}
 Restart=always
 RestartSec=10s
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -825,8 +867,7 @@ installation_proxy() {
             read_ip "Enter Foreign Server IP: " "proxy_ip"
             read -p "Enter SSH Username (default: root): " proxy_user
             proxy_user=${proxy_user:-root}
-            read_port "Enter SSH Port (default: 22): " "proxy_port"
-            proxy_port=${proxy_port:-22}
+            read_port "Enter SSH Port (default: 22): " "proxy_port" "false" 22
 
             echo -e "${CYAN}Establishing SSH tunnel... You may be prompted for password.${NC}"
             # Start SSH Dynamic Forwarding in background
