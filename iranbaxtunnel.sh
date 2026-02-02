@@ -569,10 +569,16 @@ parse_vmess_link() {
     local host=$(echo "$decoded" | jq -r '.add')
     local port=$(echo "$decoded" | jq -r '.port')
     local aid=$(echo "$decoded" | jq -r '.aid // 0')
-    local net_type=$(echo "$decoded" | jq -r '.net')
+    local net_type=$(echo "$decoded" | jq -r '.net // "tcp"')
     local path=$(echo "$decoded" | jq -r '.path // "/"')
+    local header_type=$(echo "$decoded" | jq -r '.type // "none"')
+    # Heuristic: If path is present but type is none/tcp, it might be an HTTP header
+    if [[ "$header_type" == "none" || "$header_type" == "tcp" ]] && [[ "$path" != "/" && -n "$path" ]]; then
+        header_type="http"
+    fi
+    local ws_host=$(echo "$decoded" | jq -r '.host // empty')
     local sni=$(echo "$decoded" | jq -r '.sni // empty')
-    [[ -z "$sni" || "$sni" == "null" ]] && sni=$(echo "$decoded" | jq -r '.host // empty')
+    [[ -z "$sni" || "$sni" == "null" ]] && sni="$ws_host"
     [[ -z "$sni" || "$sni" == "null" ]] && sni="$host"
     local tls_type=$(echo "$decoded" | jq -r '.tls')
     local security=$(echo "$decoded" | jq -r '.scy // "auto"')
@@ -583,9 +589,11 @@ parse_vmess_link() {
         --arg host "$host" \
         --arg port "$port" \
         --argjson aid "$aid" \
-        --arg net "${net_type:-tcp}" \
-        --arg path "${path:-/}" \
+        --arg net "$net_type" \
+        --arg type "$header_type" \
+        --arg path "$path" \
         --arg sni "$sni" \
+        --arg ws_host "$ws_host" \
         --arg tls "$tls_type" \
         --arg scy "$security" \
         --arg alpn "$alpn" \
@@ -598,7 +606,8 @@ parse_vmess_link() {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}, "host": $sni} else null end)
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}, "host": (if $ws_host != "" then $ws_host else $sni end)} else null end),
+                "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [(if $ws_host != "" then $ws_host else $sni end)]}}}} else null end)
             }
         } | del(..|nulls)'
 }
@@ -618,12 +627,18 @@ parse_vless_link() {
     get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g'; }
 
     local type=$(get_p "type")
+    local header_type=$(get_p "headerType")
+    local path=$(get_p "path")
+    [[ -n "$path" ]] && path=$(echo "$path" | sed 's/%2F/\//g; s/%2B/+/g')
+    # Heuristic: If type is tcp and path is present but headerType is missing, it might be HTTP
+    if [[ "$type" == "tcp" || -z "$type" ]] && [[ -n "$path" && "$path" != "/" && -z "$header_type" ]]; then
+        header_type="http"
+    fi
     local security=$(get_p "security")
     local sni=$(get_p "sni")
     [[ -z "$sni" ]] && sni=$(get_p "peer")
     [[ -z "$sni" ]] && sni=$(get_p "host")
     [[ -z "$sni" ]] && sni="$host"
-    local path=$(get_p "path")
     local flow=$(get_p "flow")
     local fp=$(get_p "fp")
     local alpn=$(get_p "alpn")
@@ -640,6 +655,7 @@ parse_vless_link() {
         --arg host "$host" \
         --arg port "$port" \
         --arg type "${type:-tcp}" \
+        --arg h_type "${header_type:-none}" \
         --arg security "${security:-none}" \
         --arg sni "$sni" \
         --arg path "${path:-/}" \
@@ -658,7 +674,8 @@ parse_vless_link() {
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}, "host": $ws_host} else null end)
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}, "host": $ws_host} else null end),
+                "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [$ws_host]}}}} else null end)
             }
         } | del(..|nulls)'
 }
@@ -707,11 +724,18 @@ setup_xray_relay() {
                     } |
                     # Standardize StreamSettings (Safe navigation with ?)
                     if .streamSettings then
+                        # Set security to none if it is empty string
+                        if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
                         if .streamSettings.wsSettings?.host and (.streamSettings.wsSettings.headers?.Host | not) then
                             .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
                         else . end |
                         if .streamSettings.tlsSettings? and (.streamSettings.tlsSettings.serverName | not) and .streamSettings.wsSettings?.headers?.Host then
                             .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
+                        else . end |
+                        # Fallback for SNI if missing in tlsSettings
+                        if .streamSettings.security == "tls" and (.streamSettings.tlsSettings?.serverName | not) then
+                            (.settings.vnext[0].address // .settings.address) as $fallback_sni |
+                            .streamSettings.tlsSettings.serverName = $fallback_sni
                         else . end
                     else . end
                 else . end
@@ -767,7 +791,8 @@ activate_relay() {
         echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels/CDN)"
         echo -e "2. SOCKS5 + HTTP Proxy"
         echo -e "3. ${proto^^} Relay (Best for simple Client-to-Iran setup)"
-        echo -e "${CYAN}Tip: Use Choice 1 if you want to use the SAME config in V2RayNG (WS/TLS/CDN).${NC}"
+        echo -e "${CYAN}Note: Choice 1 is HIGHLY recommended for configurations using TLS, WebSocket, or CDN.${NC}"
+        echo -e "${CYAN}With Choice 1, you can use your original config in V2RayNG by just changing the IP/Port to Iran.${NC}"
         read_num "Choice (default: 1): " "in_proto_choice" 1 3
     else
         echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
