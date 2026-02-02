@@ -27,6 +27,10 @@ SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
 XRAY_SERVICE="iranbax-xray.service"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
+XRAY_BIN="${XRAY_CORE_DIR}/xray"
+XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
+XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
+
 # Ensure directories exist
 mkdir -p "$CONFIG_DIR" "$SAVED_RELAYS_DIR"
 
@@ -61,6 +65,63 @@ check_port_in_use() {
     else
         return 1
     fi
+}
+
+# Function to check if a port is used by an existing Iranbax tunnel
+is_port_ours() {
+    local port=$1
+    local pids=$(ss -tulnp | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | sort -u)
+    [[ -z "$pids" ]] && return 1
+
+    # Check against our service PIDs
+    for svc in "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE"; do
+        local spid=$(systemctl show -p MainPID "$svc" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$spid" && "$spid" != "0" ]]; then
+            for pid in $pids; do
+                [[ "$pid" == "$spid" ]] && return 0
+            done
+        fi
+    done
+
+    # Check against our binary path
+    local our_xray_pids=$(pgrep -f "$XRAY_BIN" 2>/dev/null)
+    if [[ -n "$our_xray_pids" ]]; then
+        for pid in $pids; do
+            for opid in $our_xray_pids; do
+                [[ "$pid" == "$opid" ]] && return 0
+            done
+        done
+    fi
+
+    # Fallback: check if process name is "xray"
+    if ss -tulnp | grep ":${port} " | grep -q "\"xray\""; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Function to stop a managed service if it conflicts with a port
+stop_conflicting_service() {
+    local port=$1
+    local current_svc=$2
+
+    for svc in "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE"; do
+        [[ "$svc" == "$current_svc" ]] && continue
+        if systemctl is-active --quiet "$svc"; then
+            local cfg=""
+            [[ "$svc" == "$XRAY_SERVICE" ]] && cfg="$XRAY_CONFIG"
+            [[ "$svc" == "$XRAY_RELAY_SERVICE" ]] && cfg="$XRAY_RELAY_CONFIG"
+
+            if [[ -f "$cfg" ]]; then
+                local p=$(grep -oP '"port": \K[0-9]+' "$cfg" | head -n1)
+                if [[ "$port" == "$p" ]]; then
+                    echo -e "${YELLOW}Service $svc is using port $port. Stopping it to avoid conflict...${NC}"
+                    systemctl stop "$svc"
+                fi
+            fi
+        fi
+    done
 }
 
 # Function to validate port
@@ -104,10 +165,15 @@ read_port() {
         if is_valid_port "$input"; then
             if [[ "$check_usage" == "true" ]]; then
                 if check_port_in_use "$input"; then
-                    echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
-                    ss -tulnp | grep ":${input} "
-                    flush_stdin
-                    continue
+                    if is_port_ours "$input"; then
+                        echo -e "${YELLOW}Note: Port $input is already in use by an existing Iranbax tunnel.${NC}"
+                        echo -e "${YELLOW}It will be replaced/restarted if you proceed.${NC}"
+                    else
+                        echo -e "${RED}Error: Port $input is already in use by another process.${NC}"
+                        ss -tulnp | grep ":${input} "
+                        flush_stdin
+                        continue
+                    fi
                 fi
             fi
             eval "$var_name=\"$input\""
@@ -318,10 +384,6 @@ check_ipv6() {
 
 # --- Xray-Reality Logic ---
 
-XRAY_BIN="${XRAY_CORE_DIR}/xray"
-XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
-XRAY_SERVICE="iranbax-xray.service"
-
 download_xray() {
     local custom_url=$1
     mkdir -p "$XRAY_CORE_DIR"
@@ -516,9 +578,6 @@ manage_xray_relay() {
     done
 }
 
-XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
-XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
-
 parse_vmess_link() {
     local link=$1
     local body=$(echo "$link" | sed 's/vmess:\/\///')
@@ -671,6 +730,8 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+
+    stop_conflicting_service "$iran_port" "$XRAY_RELAY_SERVICE"
 
     cat << EOF > "$XRAY_RELAY_CONFIG"
 {
@@ -850,6 +911,8 @@ setup_xray_reality() {
         read_port "Enter the port for Xray to listen on (e.g., 443): " "server_port" "true" 443
         read_port "Enter the local port to forward traffic to (v2ray config port on Kharej): " "dest_port" "false" 80
 
+        stop_conflicting_service "$server_port" "$XRAY_SERVICE"
+
         cat << EOF > "$XRAY_CONFIG"
 {
   "log": { "loglevel": "warning" },
@@ -907,6 +970,8 @@ EOF
         read_port "Enter KHAREJ Xray Port: " "kharej_port" "false" 443
         read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
         read -p "Enter UUID from Kharej: " uuid
+
+        stop_conflicting_service "$iran_port" "$XRAY_SERVICE"
         read -p "Enter Public Key from Kharej: " public_key
         read -p "Enter Short ID from Kharej: " short_id
 
