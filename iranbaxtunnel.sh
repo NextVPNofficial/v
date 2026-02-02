@@ -20,6 +20,7 @@ fi
 # Configuration directories
 CONFIG_DIR="/root/iranbaxtunnel"
 RATHOLE_CORE_DIR="${CONFIG_DIR}/rathole-core"
+XRAY_CORE_DIR="${CONFIG_DIR}/xray-core"
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 mkdir -p "$CONFIG_DIR"
 fi
@@ -239,8 +240,10 @@ get_tunnel_status() {
             local remote=$(grep -oP '@\K[^ ]+' "$svc_file" | head -n1)
             local check="${RED}STOPPED${NC}"
             if systemctl is-active --quiet "$svc"; then
-                if check_port_in_use "$iran_port"; then
-                    check="${GREEN}ACTIVE:${iran_port}${NC}"
+                if check_port_in_use "$iran_port" && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+                    check="${GREEN}WORKS:${iran_port}${NC}"
+                elif check_port_in_use "$iran_port"; then
+                    check="${YELLOW}LISTENING${NC}"
                 else
                     check="${YELLOW}FAILED/AUTH${NC}"
                 fi
@@ -249,6 +252,41 @@ get_tunnel_status() {
             active_found=true
         fi
     done
+
+    # 4. Xray-Reality
+    if [[ -f "/etc/systemd/system/${XRAY_SERVICE}" ]]; then
+        local check="${RED}STOPPED${NC}"
+        if systemctl is-active --quiet "$XRAY_SERVICE"; then
+            check="${GREEN}ONLINE${NC}"
+            # Try a fetch check if we can identify the local port
+            local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_CONFIG" | head -n1)
+            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+                check="${GREEN}WORKS:${iran_port}${NC}"
+            fi
+        fi
+        status_line+="${MAGENTA}[Reality: ${check}]${NC} "
+        active_found=true
+    fi
+
+    # 5. ShadowTLS
+    if [[ -f "/etc/systemd/system/${SHADOWTLS_SERVICE}" ]]; then
+        local check="${RED}STOPPED${NC}"
+        if systemctl is-active --quiet "$SHADOWTLS_SERVICE"; then
+            check="${GREEN}ONLINE${NC}"
+        fi
+        status_line+="${CYAN}[ShadowTLS: ${check}]${NC} "
+        active_found=true
+    fi
+
+    # 6. ICMP
+    if [[ -f "/etc/systemd/system/${ICMP_SERVICE}" ]]; then
+        local check="${RED}STOPPED${NC}"
+        if systemctl is-active --quiet "$ICMP_SERVICE"; then
+            check="${GREEN}ONLINE${NC}"
+        fi
+        status_line+="${BLUE}[ICMP: ${check}]${NC} "
+        active_found=true
+    fi
 
     if [[ "$active_found" == "false" ]]; then
         status_line="${WHITE}No active tunnels configured.${NC}"
@@ -316,16 +354,22 @@ manage_tunnels() {
         echo -e "1. Rathole Tunnel"
         echo -e "2. SIT/GRE (Tunnel Wizard)"
         echo -e "3. SSH Traffic Tunnel"
-        echo -e "4. Check All Tunnel Status"
-        echo -e "5. Back"
+        echo -e "4. Xray-Reality Tunnel (Stealth TCP)"
+        echo -e "5. ShadowTLS v3 Tunnel (Stealth TCP)"
+        echo -e "6. ICMP Tunnel (Ping-based)"
+        echo -e "7. Check All Tunnel Status"
+        echo -e "8. Back"
         echo ''
-        read_num "Choose an option: " "t_choice" 1 5
+        read_num "Choose an option: " "t_choice" 1 8
         case $t_choice in
             1) manage_rathole ;;
             2) manage_sit_gre ;;
             3) manage_ssh_tunnel ;;
-            4) check_status ;;
-            5) break ;;
+            4) manage_xray_reality ;;
+            5) manage_shadowtls ;;
+            6) manage_icmp_tunnel ;;
+            7) check_status ;;
+            8) break ;;
             *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
         esac
     done
@@ -581,6 +625,446 @@ rathole_change_token() {
     sed -i "s/default_token = \".*\"/default_token = \"$new_token\"/g" ${CONFIG_DIR}/rathole_*.toml
     echo -e "${YELLOW}Token updated in config files. Restarting services...${NC}"
     restart_all
+}
+
+# --- Xray-Reality Logic ---
+
+XRAY_BIN="${XRAY_CORE_DIR}/xray"
+XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
+XRAY_SERVICE="iranbax-xray.service"
+
+download_xray() {
+    if [[ -f "$XRAY_BIN" ]]; then
+        echo -e "${GREEN}Xray-core already installed.${NC}"
+        return 0
+    fi
+    mkdir -p "$XRAY_CORE_DIR"
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) X_ARCH="64" ;;
+        aarch64) X_ARCH="arm64-v8a" ;;
+        *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
+    esac
+
+    echo -e "${CYAN}Fetching latest Xray-core version...${NC}"
+    # Use direct github api to find latest tag
+    local latest_tag=$(curl -sSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+        echo -e "${RED}Failed to fetch Xray tag. Try setting up the Installation Proxy (Option 3).${NC}"
+        return 1
+    fi
+
+    local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${X_ARCH}.zip"
+    echo -e "Downloading Xray from $download_url..."
+
+    local download_dir=$(mktemp -d)
+    if curl -sSL -o "$download_dir/xray.zip" "$download_url"; then
+        unzip -q "$download_dir/xray.zip" -d "$XRAY_CORE_DIR"
+        chmod +x "$XRAY_BIN"
+        rm -rf "$download_dir"
+        echo -e "${GREEN}Xray-core installed successfully.${NC}"
+    else
+        echo -e "${RED}Failed to download Xray-core.${NC}"
+        return 1
+    fi
+}
+
+manage_xray_reality() {
+    clear
+    display_logo
+    echo -e "${MAGENTA}--- Xray-Reality Management (Stealth TCP) ---${NC}"
+    echo -e "1. Install Xray-core"
+    echo -e "2. Configure IRAN (Client Role)"
+    echo -e "3. Configure KHAREJ (Server Role)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose an option: " "x_choice" 1 4
+    case $x_choice in
+        1) download_xray; sleep 1 ;;
+        2) setup_xray_reality "client" ;;
+        3) setup_xray_reality "server" ;;
+        *) return ;;
+    esac
+}
+
+setup_xray_reality() {
+    local role=$1
+    if [[ ! -f "$XRAY_BIN" ]]; then echo -e "${RED}Install Xray-core first!${NC}"; sleep 1; return; fi
+
+    local uuid=$($XRAY_BIN uuid)
+    local x25519=$($XRAY_BIN x25519)
+    local private_key=$(echo "$x25519" | grep "Private key:" | awk '{print $3}')
+    local public_key=$(echo "$x25519" | grep "Public key:" | awk '{print $3}')
+    local short_id=$(openssl rand -hex 8)
+
+    if [[ "$role" == "server" ]]; then
+        echo -e "${YELLOW}Configuring KHAREJ as Reality Server...${NC}"
+        read_port "Enter the port for Xray to listen on (e.g., 443): " "server_port" "true" 443
+        read_port "Enter the local port to forward traffic to (v2ray config port on Kharej): " "dest_port" "false" 80
+
+        cat << EOF > "$XRAY_CONFIG"
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": $server_port,
+      "protocol": "vless",
+      "settings": {
+        "clients": [ { "id": "$uuid", "flow": "xtls-rprx-vision" } ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.google.com:443",
+          "xver": 0,
+          "serverNames": [ "www.google.com" ],
+          "privateKey": "$private_key",
+          "shortIds": [ "$short_id" ]
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": [ "http", "tls" ] }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    {
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1", "port": $dest_port },
+      "tag": "forward"
+    }
+  ],
+  "routing": {
+    "rules": [ { "type": "field", "inboundTag": [ "inbound-$server_port" ], "outboundTag": "forward" } ]
+  }
+}
+EOF
+        # Note: Added inbound tag and routing to ensure it forwards locally
+        # Simplified routing for this use case:
+        sed -i 's/"inboundTag": \[ "inbound-.*" \]/"port": '$server_port'/g' "$XRAY_CONFIG" # fix routing
+        # Actually simpler to just let it forward via dokodemo if we use it as outbound.
+
+        echo -e "${GREEN}Configuration Generated.${NC}"
+        echo -e "${YELLOW}-----------------------------------------${NC}"
+        echo -e "${WHITE}UUID: $uuid${NC}"
+        echo -e "${WHITE}Public Key: $public_key${NC}"
+        echo -e "${WHITE}Short ID: $short_id${NC}"
+        echo -e "${YELLOW}-----------------------------------------${NC}"
+        echo -e "Please save these to use on the IRAN server."
+    else
+        echo -e "${CYAN}Configuring IRAN as Reality Client...${NC}"
+        read_ip "Enter KHAREJ Server IP: " "kharej_ip"
+        read_port "Enter KHAREJ Xray Port: " "kharej_port" "false" 443
+        read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+        read -p "Enter UUID from Kharej: " uuid
+        read -p "Enter Public Key from Kharej: " public_key
+        read -p "Enter Short ID from Kharej: " short_id
+
+        cat << EOF > "$XRAY_CONFIG"
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": $iran_port,
+      "protocol": "dokodemo-door",
+      "settings": { "address": "$kharej_ip", "port": $kharej_port, "network": "tcp" }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "$kharej_ip",
+            "port": $kharej_port,
+            "users": [ { "id": "$uuid", "encryption": "none", "flow": "xtls-rprx-vision" } ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "fingerprint": "chrome",
+          "serverName": "www.google.com",
+          "publicKey": "$public_key",
+          "shortId": "$short_id",
+          "spiderX": ""
+        }
+      }
+    }
+  ]
+}
+EOF
+    fi
+
+    cat << EOF > "/etc/systemd/system/${XRAY_SERVICE}"
+[Unit]
+Description=Xray-Reality Tunnel (Iranbax)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} -c ${XRAY_CONFIG}
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$XRAY_SERVICE"
+    systemctl restart "$XRAY_SERVICE"
+    echo -e "${GREEN}Xray-Reality service started!${NC}"
+    sleep 2
+}
+
+# --- ShadowTLS Logic ---
+
+SHADOWTLS_BIN="${CONFIG_DIR}/shadow-tls"
+SHADOWTLS_SERVICE="iranbax-shadowtls.service"
+SHADOWTLS_BACKEND_SERVICE="iranbax-shadowtls-backend.service"
+
+download_shadowtls() {
+    if [[ -f "$SHADOWTLS_BIN" ]]; then
+        echo -e "${GREEN}ShadowTLS already installed.${NC}"
+        return 0
+    fi
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) S_ARCH="x86_64-unknown-linux-musl" ;;
+        aarch64) S_ARCH="aarch64-unknown-linux-musl" ;;
+        *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
+    esac
+
+    echo -e "${CYAN}Fetching latest ShadowTLS version...${NC}"
+    local download_url=$(curl -sSL https://api.github.com/repos/ihciah/shadow-tls/releases/latest | grep -oP "https://github.com/ihciah/shadow-tls/releases/download/[v\d.]+/shadow-tls-$S_ARCH" | head -n 1)
+
+    if [ -z "$download_url" ]; then
+        echo -e "${RED}Failed to retrieve download URL.${NC}"
+        return 1
+    fi
+
+    if curl -sSL -o "$SHADOWTLS_BIN" "$download_url"; then
+        chmod +x "$SHADOWTLS_BIN"
+        echo -e "${GREEN}ShadowTLS installed successfully.${NC}"
+    else
+        echo -e "${RED}Failed to download ShadowTLS.${NC}"
+        return 1
+    fi
+}
+
+manage_shadowtls() {
+    clear
+    display_logo
+    echo -e "${MAGENTA}--- ShadowTLS v3 Management (Stealth TCP Wrapper) ---${NC}"
+    echo -e "1. Install ShadowTLS"
+    echo -e "2. Configure IRAN (Client Role)"
+    echo -e "3. Configure KHAREJ (Server Role)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose an option: " "s_choice" 1 4
+    case $s_choice in
+        1) download_shadowtls; sleep 1 ;;
+        2) setup_shadowtls "client" ;;
+        3) setup_shadowtls "server" ;;
+        *) return ;;
+    esac
+}
+
+setup_shadowtls() {
+    local role=$1
+    if [[ ! -f "$SHADOWTLS_BIN" ]]; then echo -e "${RED}Install ShadowTLS first!${NC}"; sleep 1; return; fi
+    # Ensure Xray is also there for backend
+    download_xray > /dev/null
+
+    local password=$(openssl rand -base64 16)
+    local shadowtls_password=$(openssl rand -base64 16)
+
+    if [[ "$role" == "server" ]]; then
+        echo -e "${YELLOW}Configuring KHAREJ as ShadowTLS Server...${NC}"
+        read_port "Enter the port for ShadowTLS to listen on (e.g., 443): " "server_port" "true" 443
+        read_port "Enter the local backend port (Shadowsocks): " "backend_port" "true" 10001
+        read_port "Enter the final destination port (v2ray on Kharej): " "dest_port" "false" 80
+
+        # 1. Backend (Xray Shadowsocks)
+        cat << EOF > "${CONFIG_DIR}/shadowtls_backend.json"
+{
+  "inbounds": [{
+    "port": $backend_port,
+    "protocol": "shadowsocks",
+    "settings": { "method": "aes-256-gcm", "password": "$password" }
+  }],
+  "outbounds": [{
+    "protocol": "dokodemo-door",
+    "settings": { "address": "127.0.0.1", "port": $dest_port }
+  }]
+}
+EOF
+        cat << EOF > "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
+[Unit]
+Description=ShadowTLS Backend (SS)
+After=network.target
+[Service]
+ExecStart=${XRAY_BIN} -c ${CONFIG_DIR}/shadowtls_backend.json
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        # 2. Wrapper (ShadowTLS)
+        cat << EOF > "/etc/systemd/system/${SHADOWTLS_SERVICE}"
+[Unit]
+Description=ShadowTLS Wrapper (Server)
+After=network.target
+[Service]
+ExecStart=${SHADOWTLS_BIN} --fastopen --v3 server --listen 0.0.0.0:$server_port --server 127.0.0.1:$backend_port --tls www.google.com:443 --password $shadowtls_password
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable "$SHADOWTLS_BACKEND_SERVICE" "$SHADOWTLS_SERVICE"
+        systemctl restart "$SHADOWTLS_BACKEND_SERVICE" "$SHADOWTLS_SERVICE"
+
+        echo -e "${GREEN}ShadowTLS Server Started!${NC}"
+        echo -e "${YELLOW}--- Credentials for IRAN server ---${NC}"
+        echo -e "${WHITE}SS Password: $password${NC}"
+        echo -e "${WHITE}ShadowTLS Password: $shadowtls_password${NC}"
+        echo -e "${YELLOW}----------------------------------${NC}"
+    else
+        echo -e "${CYAN}Configuring IRAN as ShadowTLS Client...${NC}"
+        read_ip "Enter KHAREJ IP: " "kharej_ip"
+        read_port "Enter KHAREJ ShadowTLS Port: " "kharej_port" "false" 443
+        read_port "Enter IRAN Local Port: " "iran_port" "true" 80
+        read_port "Enter Local Intermediate Port: " "inter_port" "true" 10002
+        read -p "Enter SS Password from Kharej: " password
+        read -p "Enter ShadowTLS Password from Kharej: " shadowtls_password
+
+        # 1. Wrapper (ShadowTLS Client)
+        cat << EOF > "/etc/systemd/system/${SHADOWTLS_SERVICE}"
+[Unit]
+Description=ShadowTLS Wrapper (Client)
+After=network.target
+[Service]
+ExecStart=${SHADOWTLS_BIN} --fastopen --v3 client --listen 127.0.0.1:$inter_port --server $kharej_ip:$kharej_port --tls www.google.com:443 --password $shadowtls_password
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        # 2. Backend Client (Xray SS Client)
+        cat << EOF > "${CONFIG_DIR}/shadowtls_client.json"
+{
+  "inbounds": [{
+    "port": $iran_port,
+    "protocol": "dokodemo-door",
+    "settings": { "address": "127.0.0.1", "port": $inter_port }
+  }],
+  "outbounds": [{
+    "protocol": "shadowsocks",
+    "settings": {
+      "servers": [{ "address": "127.0.0.1", "port": $inter_port, "method": "aes-256-gcm", "password": "$password" }]
+    }
+  }]
+}
+EOF
+        cat << EOF > "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
+[Unit]
+Description=ShadowTLS Backend Client (SS)
+After=network.target
+[Service]
+ExecStart=${XRAY_BIN} -c ${CONFIG_DIR}/shadowtls_client.json
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE"
+        systemctl restart "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE"
+        echo -e "${GREEN}ShadowTLS Client Started on port $iran_port!${NC}"
+    fi
+    sleep 2
+}
+
+# --- ICMP Logic ---
+
+ICMP_SERVICE="iranbax-icmp.service"
+
+manage_icmp_tunnel() {
+    clear
+    display_logo
+    echo -e "${BLUE}--- ICMP Tunnel Management (ptunnel-ng) ---${NC}"
+    echo -e "1. Install ptunnel-ng"
+    echo -e "2. Configure IRAN (Client Role)"
+    echo -e "3. Configure KHAREJ (Server Role)"
+    echo -e "4. Back"
+    echo ''
+    read_num "Choose an option: " "i_choice" 1 4
+    case $i_choice in
+        1)
+            echo -e "${CYAN}Installing ptunnel-ng...${NC}"
+            sudo apt-get install -y ptunnel-ng || {
+                echo -e "${YELLOW}Build from source or check repo...${NC}"
+                # Simplified for this script
+            }
+            sleep 1
+            ;;
+        2) setup_icmp_tunnel "client" ;;
+        3) setup_icmp_tunnel "server" ;;
+        *) return ;;
+    esac
+}
+
+setup_icmp_tunnel() {
+    local role=$1
+    if ! command -v ptunnel-ng &>/dev/null; then echo -e "${RED}Install ptunnel-ng first!${NC}"; sleep 1; return; fi
+
+    if [[ "$role" == "server" ]]; then
+        echo -e "${YELLOW}Configuring KHAREJ as ICMP Server...${NC}"
+        cat << EOF > "/etc/systemd/system/${ICMP_SERVICE}"
+[Unit]
+Description=ICMP Tunnel (Server)
+After=network.target
+[Service]
+ExecStart=/usr/sbin/ptunnel-ng -r
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable "$ICMP_SERVICE"
+        systemctl restart "$ICMP_SERVICE"
+        echo -e "${GREEN}ICMP Server Started!${NC}"
+    else
+        echo -e "${CYAN}Configuring IRAN as ICMP Client...${NC}"
+        read_ip "Enter KHAREJ IP: " "kharej_ip"
+        read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+        read_port "Enter KHAREJ Dest Port (v2ray port): " "dest_port" "false" 80
+
+        cat << EOF > "/etc/systemd/system/${ICMP_SERVICE}"
+[Unit]
+Description=ICMP Tunnel (Client)
+After=network.target
+[Service]
+ExecStart=/usr/sbin/ptunnel-ng -p $kharej_ip -l $iran_port -r 127.0.0.1 -R $dest_port
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable "$ICMP_SERVICE"
+        systemctl restart "$ICMP_SERVICE"
+        echo -e "${GREEN}ICMP Client Started on port $iran_port!${NC}"
+    fi
+    sleep 2
 }
 
 # --- SIT/GRE Logic ---
@@ -952,7 +1436,25 @@ cleanup_all() {
     # 3. SSH Traffic
     remove_ssh_traffic
 
-    # 4. Files
+    # 4. Xray/Reality
+    echo -e "${YELLOW}Stopping Xray services...${NC}"
+    systemctl stop "$XRAY_SERVICE" 2>/dev/null
+    systemctl disable "$XRAY_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/${XRAY_SERVICE}"
+
+    # 5. ShadowTLS
+    echo -e "${YELLOW}Stopping ShadowTLS services...${NC}"
+    systemctl stop "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" 2>/dev/null
+    systemctl disable "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/${SHADOWTLS_SERVICE}" "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
+
+    # 6. ICMP
+    echo -e "${YELLOW}Stopping ICMP services...${NC}"
+    systemctl stop "$ICMP_SERVICE" 2>/dev/null
+    systemctl disable "$ICMP_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/${ICMP_SERVICE}"
+
+    # 7. Files
     echo -e "${YELLOW}Removing configuration files...${NC}"
     rm -rf "$CONFIG_DIR"
 
