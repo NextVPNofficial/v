@@ -446,12 +446,17 @@ create_relay_manual() {
     echo -e "Choose Protocol:"
     echo "1. VLESS"
     echo "2. VMESS"
-    read_num "Choice: " "proto_choice" 1 2
+    echo "3. Plain TCP (Simple Bridge)"
+    read_num "Choice: " "proto_choice" 1 3
     local proto="vless"
     [[ $proto_choice -eq 2 ]] && proto="vmess"
+    [[ $proto_choice -eq 3 ]] && proto="plain"
 
-    read -p "Enter UUID: " uuid
-    [[ -z "$uuid" ]] && { echo -e "${RED}UUID cannot be empty.${NC}"; sleep 1; return; }
+    local uuid=""
+    if [[ "$proto" != "plain" ]]; then
+        read -p "Enter UUID: " uuid
+        [[ -z "$uuid" ]] && { echo -e "${RED}UUID cannot be empty.${NC}"; sleep 1; return; }
+    fi
 
     echo -e "Choose Transport:"
     echo "1. TCP"
@@ -481,28 +486,41 @@ create_relay_manual() {
     fi
 
     # Build the outbound JSON using jq
-    local outbound=$(jq -n \
-        --arg proto "$proto" \
-        --arg addr "$rem_addr" \
-        --argjson port "$rem_port" \
-        --arg uuid "$uuid" \
-        --arg transport "$transport" \
-        --arg security "$security" \
-        --arg sni "$sni" \
-        --arg path "$path" \
-        '{
-            "protocol": $proto,
-            "settings": {
-                "vnext": [{"address": $addr, "port": $port, "users": [{"id": $uuid, "encryption": "none"}]}]
-            },
-            "streamSettings": {
-                "network": $transport,
-                "security": $security,
-                "tlsSettings": (if $security == "tls" then {"serverName": $sni} else null end),
-                "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
-                "wsSettings": (if $transport == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
-            }
-        }')
+    local outbound=""
+    if [[ "$proto" == "plain" ]]; then
+        outbound=$(jq -n \
+            --arg addr "$rem_addr" \
+            --argjson port "$rem_port" \
+            '{
+                "protocol": "freedom",
+                "settings": {
+                    "redirect": ($addr + ":" + ($port|tostring))
+                }
+            }')
+    else
+        outbound=$(jq -n \
+            --arg proto "$proto" \
+            --arg addr "$rem_addr" \
+            --argjson port "$rem_port" \
+            --arg uuid "$uuid" \
+            --arg transport "$transport" \
+            --arg security "$security" \
+            --arg sni "$sni" \
+            --arg path "$path" \
+            '{
+                "protocol": $proto,
+                "settings": {
+                    "vnext": [{"address": $addr, "port": $port, "users": [{"id": $uuid, "encryption": "none"}]}]
+                },
+                "streamSettings": {
+                    "network": $transport,
+                    "security": $security,
+                    "tlsSettings": (if $security == "tls" then {"serverName": $sni} else null end),
+                    "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
+                    "wsSettings": (if $transport == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+                }
+            }')
+    fi
 
     # Fix VMESS security if needed
     if [[ "$proto" == "vmess" ]]; then
@@ -553,20 +571,24 @@ parse_vmess_link() {
     local aid=$(echo "$decoded" | jq -r '.aid // 0')
     local net_type=$(echo "$decoded" | jq -r '.net')
     local path=$(echo "$decoded" | jq -r '.path // "/"')
-    local sni=$(echo "$decoded" | jq -r '.sni // .host')
+    local sni=$(echo "$decoded" | jq -r '.sni // empty')
+    [[ -z "$sni" || "$sni" == "null" ]] && sni=$(echo "$decoded" | jq -r '.host // empty')
+    [[ -z "$sni" || "$sni" == "null" ]] && sni="$host"
     local tls_type=$(echo "$decoded" | jq -r '.tls')
     local security=$(echo "$decoded" | jq -r '.scy // "auto"')
+    local alpn=$(echo "$decoded" | jq -r '.alpn // empty')
 
     jq -n \
         --arg uuid "$uuid" \
         --arg host "$host" \
         --arg port "$port" \
         --argjson aid "$aid" \
-        --arg net "$net_type" \
-        --arg path "$path" \
+        --arg net "${net_type:-tcp}" \
+        --arg path "${path:-/}" \
         --arg sni "$sni" \
         --arg tls "$tls_type" \
         --arg scy "$security" \
+        --arg alpn "$alpn" \
         '{
             "protocol": "vmess",
             "settings": {
@@ -575,7 +597,7 @@ parse_vmess_link() {
             "streamSettings": {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
-                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true} else null end),
+                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
             }
         }'
@@ -600,10 +622,16 @@ parse_vless_link() {
     local sni=$(get_p "sni")
     [[ -z "$sni" ]] && sni=$(get_p "peer")
     [[ -z "$sni" ]] && sni=$(get_p "host")
+    [[ -z "$sni" ]] && sni="$host"
     local path=$(get_p "path")
     local flow=$(get_p "flow")
     local fp=$(get_p "fp")
     local alpn=$(get_p "alpn")
+    local insecure=$(get_p "insecure")
+    [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
+
+    local allow_ins=false
+    [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
 
     jq -n \
         --arg uuid "$uuid" \
@@ -616,6 +644,7 @@ parse_vless_link() {
         --arg flow "$flow" \
         --arg fp "${fp:-chrome}" \
         --arg alpn "$alpn" \
+        --argjson allow_ins "$allow_ins" \
         '{
             "protocol": "vless",
             "settings": {
@@ -624,7 +653,7 @@ parse_vless_link() {
             "streamSettings": {
                 "network": $type,
                 "security": $security,
-                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
+                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
                 "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
             }
@@ -655,13 +684,13 @@ setup_xray_relay() {
                 if .protocol == "vless" or .protocol == "vmess" then
                     .settings = {
                         "vnext": [{
-                            "address": .settings.address,
-                            "port": .settings.port,
+                            "address": (.settings.address | tostring),
+                            "port": (.settings.port | tonumber),
                             "users": [{
-                                "id": (.settings.id // .settings.users[0].id),
-                                "encryption": (.settings.encryption // "none"),
-                                "flow": (.settings.flow // ""),
-                                "security": (.settings.security // "auto")
+                                "id": ((.settings.id // .settings.users[0].id) | tostring),
+                                "encryption": ((.settings.encryption // "none") | tostring),
+                                "flow": ((.settings.flow // "") | tostring),
+                                "security": ((.settings.security // "auto") | tostring)
                             }]
                         }]
                     }
@@ -707,16 +736,22 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
-    local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // 0')
+    local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.redirect // 0' | awk -F':' '{print $NF}')
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    echo -e "\nChoose Entry Protocol for Iran Server:"
-    echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels)"
-    echo -e "2. SOCKS5 + HTTP Proxy"
-    echo -e "3. ${proto^^} Relay (UUID validation enabled)"
-    read_num "Choice (default: 1): " "in_proto_choice" 1 3
+    local in_proto_choice=1
+    if [[ "$proto" != "freedom" ]]; then
+        echo -e "\nChoose Entry Protocol for Iran Server:"
+        echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels)"
+        echo -e "2. SOCKS5 + HTTP Proxy"
+        echo -e "3. ${proto^^} Relay (UUID validation enabled)"
+        read_num "Choice (default: 1): " "in_proto_choice" 1 3
+    else
+        echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
+        in_proto_choice=1
+    fi
     in_proto_choice=${in_proto_choice:-1}
 
     local inbound_json=""
@@ -748,7 +783,7 @@ activate_relay() {
                     \"protocol\": \"vless\",
                     \"settings\": { \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }
                 }"
-            else
+            elif [[ "$proto" == "vmess" ]]; then
                 inbound_json="{
                     \"port\": $iran_port,
                     \"protocol\": \"vmess\",
@@ -758,13 +793,15 @@ activate_relay() {
             ;;
     esac
 
-    cat << EOF > "$XRAY_RELAY_CONFIG"
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [ $inbound_json ],
-  "outbounds": [ $outbound ]
-}
-EOF
+    # Safe JSON assembly using jq to avoid shell expansion issues
+    jq -n \
+        --argjson inb "$inbound_json" \
+        --argjson outb "$outbound" \
+        '{
+          "log": { "loglevel": "warning" },
+          "inbounds": [$inb],
+          "outbounds": [$outb]
+        }' > "$XRAY_RELAY_CONFIG"
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
@@ -1059,6 +1096,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+    local port_to_check="$iran_port"
+    [[ "$role" == "server" ]] && port_to_check="$server_port"
+    stop_conflicting_service "$port_to_check"
     systemctl daemon-reload
     systemctl enable "$XRAY_SERVICE"
     systemctl restart "$XRAY_SERVICE"
