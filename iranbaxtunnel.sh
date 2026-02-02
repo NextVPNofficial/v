@@ -7,6 +7,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\e[36m'
 MAGENTA="\e[95m"
+WHITE="\e[97m"
 NC='\033[0m' # No Color
 
 # Check if the script is run as root
@@ -142,6 +143,81 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 ensure_deps
 fi
 
+# --- Status Topbar Logic ---
+
+get_tunnel_status() {
+    local status_line=""
+    local active_found=false
+
+    # 1. Rathole
+    if systemctl is-active --quiet "rathole-iran.service"; then
+        local tunnel_port=$(grep "bind_addr" "$IRAN_RATHOLE_CONFIG" | head -n1 | awk -F':' '{print $NF}' | tr -d '"')
+        status_line+="${YELLOW}[Rathole Server: Listening on ${tunnel_port}]${NC} "
+        active_found=true
+    fi
+    for svc in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service' | sort -u); do
+        if systemctl is-active --quiet "$svc"; then
+            local idx=$(echo "$svc" | grep -oE '[0-9]+')
+            local config="${CONFIG_DIR}/rathole_client_s${idx}.toml"
+            if [[ -f "$config" ]]; then
+                local remote=$(grep "remote_addr" "$config" | awk -F'"' '{print $2}')
+                local remote_ip=$(echo "$remote" | awk -F':' '{print $1}')
+                local check="${RED}OFFLINE${NC}"
+                if ping -c 1 -W 1 "$remote_ip" &>/dev/null; then check="${GREEN}ONLINE${NC}"; fi
+                status_line+="${CYAN}[Rathole: ${remote} (${check})]${NC} "
+                active_found=true
+            fi
+        fi
+    done
+
+    # 2. SIT/GRE
+    if ip link show "$TUNNEL_6TO4" &>/dev/null; then
+        local remote=$(ip tunnel show "$TUNNEL_6TO4" | grep -oP 'remote \K[^ ]+')
+        local check="${RED}OFFLINE${NC}"
+        # For SIT/GRE, we try to ping the remote tunnel IPv4
+        if ping -c 1 -W 1 "172.16.0.1" &>/dev/null || ping -c 1 -W 1 "172.16.0.2" &>/dev/null; then
+            check="${GREEN}ONLINE${NC}"
+        elif ping -c 1 -W 1 "$remote" &>/dev/null; then
+            check="${YELLOW}HOST-ONLY${NC}"
+        fi
+        status_line+="${BLUE}[SIT/GRE: -> ${remote} (${check})]${NC} "
+        active_found=true
+    fi
+
+    # 3. SSH Tunnels
+    for svc in $(systemctl list-units --type=service --all | grep -oE 'ssh-tunnel-[0-9]+\.service' | sort -u); do
+        if systemctl is-active --quiet "$svc"; then
+            local remote=$(grep -oP '@\K[^ ]+' "/etc/systemd/system/$svc")
+            local check="${RED}OFFLINE${NC}"
+            if ping -c 1 -W 1 "$remote" &>/dev/null; then check="${GREEN}ONLINE${NC}"; fi
+            status_line+="${MAGENTA}[SSH: -> ${remote} (${check})]${NC} "
+            active_found=true
+        fi
+    done
+
+    if [[ "$active_found" == "false" ]]; then
+        status_line="${WHITE}No active tunnels.${NC}"
+    fi
+
+    echo -e "$status_line"
+}
+
+get_proxy_status() {
+    if pgrep -f "ssh -D 1080" > /dev/null; then
+        echo -e "${GREEN}ON${NC}"
+    else
+        echo -e "${RED}OFF${NC}"
+    fi
+}
+
+display_topbar() {
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -n -e "${BLUE}║${NC} ${YELLOW}Tunnels:${NC} "
+    get_tunnel_status
+    echo -e "${BLUE}║${NC} ${YELLOW}Installation Proxy:${NC} $(get_proxy_status)"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
+}
+
 # Function to display ASCII logo
 display_logo() {
     echo -e "${CYAN}"
@@ -162,6 +238,7 @@ EOF
 # Function to display main menu
 display_menu() {
     clear
+    display_topbar
     display_logo
     echo ''
     echo -e "${CYAN}1. Tunneling Management (Rathole, SIT/GRE, SSH, Status)${NC}"
