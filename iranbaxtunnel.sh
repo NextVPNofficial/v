@@ -21,6 +21,7 @@ fi
 CONFIG_DIR="/root/iranbaxtunnel"
 RATHOLE_CORE_DIR="${CONFIG_DIR}/rathole-core"
 XRAY_CORE_DIR="${CONFIG_DIR}/xray-core"
+SAVED_PROXIES_FILE="${CONFIG_DIR}/saved_proxies.txt"
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 mkdir -p "$CONFIG_DIR"
 fi
@@ -1377,49 +1378,121 @@ check_install_proxy() {
     fi
 }
 
+save_proxy() {
+    local ip=$1
+    local user=$2
+    local port=$3
+    local entry="${user}@${ip}:${port}"
+    touch "$SAVED_PROXIES_FILE"
+    if ! grep -q "^${entry}$" "$SAVED_PROXIES_FILE"; then
+        echo "$entry" >> "$SAVED_PROXIES_FILE"
+    fi
+}
+
+connect_installation_proxy() {
+    local ip=$1
+    local user=$2
+    local port=$3
+
+    echo ''
+    read -p "Do you want to setup SSH Keys first? (y/n): " setup_keys
+    [[ "$setup_keys" == "y" ]] && setup_ssh_keys "$ip" "$user" "$port"
+
+    echo -e "${CYAN}Establishing SSH tunnel...${NC}"
+    # Start SSH Dynamic Forwarding in background
+    ssh -D 1080 -C -N -f -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${user}@${ip}"
+
+    if [ $? -eq 0 ]; then
+        export http_proxy="socks5h://127.0.0.1:1080"
+        export https_proxy="socks5h://127.0.0.1:1080"
+        echo 'Acquire::http::Proxy "socks5h://127.0.0.1:1080/"; Acquire::https::Proxy "socks5h://127.0.0.1:1080/";' | sudo tee /etc/apt/apt.conf.d/99proxy > /dev/null
+        echo -e "${GREEN}Proxy established! http_proxy/https_proxy set to socks5h://127.0.0.1:1080${NC}"
+        save_proxy "$ip" "$user" "$port"
+    else
+        echo -e "${RED}Failed to establish SSH tunnel.${NC}"
+    fi
+    sleep 2
+}
+
 installation_proxy() {
-    clear
-    display_logo
-    echo -e "${YELLOW}--- Installation Proxy Settings ---${NC}"
-    echo -e "This helps if your server (Iran) cannot reach GitHub or foreign sites."
-    echo ''
-    echo -e "1. Set Up SSH SOCKS5 Proxy"
-    echo -e "2. Clear Proxy Settings"
-    echo -e "3. Back"
-    echo ''
-    read_num "Choose an option: " "proxy_choice" 1 3
+    while true; do
+        clear
+        display_logo
+        echo -e "${YELLOW}--- Installation Proxy Settings ---${NC}"
+        echo -e "This helps if your server (Iran) cannot reach GitHub or foreign sites."
+        echo ''
+        echo -e "1. New SSH SOCKS5 Proxy"
+        echo -e "2. Use a Saved Proxy"
+        echo -e "3. Manage Saved Proxies (Delete)"
+        echo -e "4. Clear Active Proxy Settings"
+        echo -e "5. Back"
+        echo ''
+        read_num "Choose an option: " "proxy_choice" 1 5
 
-    case $proxy_choice in
-        1)
-            read_ip "Enter Foreign Server IP: " "proxy_ip"
-            read -p "Enter SSH Username (default: root): " proxy_user
-            proxy_user=${proxy_user:-root}
-            read_port "Enter SSH Port (default: 22): " "proxy_port" "false" 22
-
-            echo ''
-            read -p "Do you want to setup SSH Keys first? (y/n): " setup_keys
-            [[ "$setup_keys" == "y" ]] && setup_ssh_keys "$proxy_ip" "$proxy_user" "$proxy_port"
-
-            echo -e "${CYAN}Establishing SSH tunnel...${NC}"
-            # Start SSH Dynamic Forwarding in background
-            ssh -D 1080 -C -N -f -p "$proxy_port" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${proxy_user}@${proxy_ip}"
-
-            if [ $? -eq 0 ]; then
-                export http_proxy="socks5h://127.0.0.1:1080"
-                export https_proxy="socks5h://127.0.0.1:1080"
-                echo 'Acquire::http::Proxy "socks5h://127.0.0.1:1080/"; Acquire::https::Proxy "socks5h://127.0.0.1:1080/";' | sudo tee /etc/apt/apt.conf.d/99proxy > /dev/null
-                echo -e "${GREEN}Proxy established! http_proxy/https_proxy set to socks5h://127.0.0.1:1080${NC}"
-            else
-                echo -e "${RED}Failed to establish SSH tunnel.${NC}"
-            fi
-            sleep 2
-            ;;
-        2)
-            clear_proxy
-            sleep 2
-            ;;
-        *) return ;;
-    esac
+        case $proxy_choice in
+            1)
+                read_ip "Enter Foreign Server IP: " "proxy_ip"
+                read -p "Enter SSH Username (default: root): " proxy_user
+                proxy_user=${proxy_user:-root}
+                read_port "Enter SSH Port (default: 22): " "proxy_port" "false" 22
+                connect_installation_proxy "$proxy_ip" "$proxy_user" "$proxy_port"
+                ;;
+            2)
+                if [[ ! -s "$SAVED_PROXIES_FILE" ]]; then
+                    echo -e "${RED}No saved proxies found.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo -e "${CYAN}--- Saved Proxies ---${NC}"
+                local i=1
+                local proxies=()
+                while IFS= read -r line; do
+                    echo -e "$i. $line"
+                    proxies+=("$line")
+                    ((i++))
+                done < "$SAVED_PROXIES_FILE"
+                read_num "Select a proxy to connect (0 to cancel): " "selected_idx" 0 $((i-1))
+                if [[ $selected_idx -gt 0 ]]; then
+                    local selected="${proxies[$((selected_idx-1))]}"
+                    local user=$(echo "$selected" | awk -F'@' '{print $1}')
+                    local ip_port=$(echo "$selected" | awk -F'@' '{print $2}')
+                    local ip=$(echo "$ip_port" | awk -F':' '{print $1}')
+                    local port=$(echo "$ip_port" | awk -F':' '{print $2}')
+                    connect_installation_proxy "$ip" "$user" "$port"
+                fi
+                ;;
+            3)
+                if [[ ! -s "$SAVED_PROXIES_FILE" ]]; then
+                    echo -e "${RED}No saved proxies found.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo -e "${RED}--- Delete Saved Proxies ---${NC}"
+                local i=1
+                local proxies=()
+                while IFS= read -r line; do
+                    echo -e "$i. $line"
+                    proxies+=("$line")
+                    ((i++))
+                done < "$SAVED_PROXIES_FILE"
+                read_num "Select a proxy to delete (0 to cancel, 99 to delete all): " "del_idx" 0 99
+                if [[ $del_idx -eq 99 ]]; then
+                    rm -f "$SAVED_PROXIES_FILE"
+                    echo -e "${GREEN}All saved proxies deleted.${NC}"
+                elif [[ $del_idx -gt 0 && $del_idx -lt $i ]]; then
+                    local to_delete="${proxies[$((del_idx-1))]}"
+                    sed -i "\|^${to_delete}$|d" "$SAVED_PROXIES_FILE"
+                    echo -e "${GREEN}Deleted $to_delete${NC}"
+                fi
+                sleep 1
+                ;;
+            4)
+                clear_proxy
+                sleep 2
+                ;;
+            5) break ;;
+        esac
+    done
 }
 cleanup_all() {
     echo -e "${RED}--- Destroying All Tunnels & Cleaning Up ---${NC}"
