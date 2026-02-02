@@ -256,8 +256,15 @@ get_tunnel_status() {
         active_found=true
     fi
 
+    # 3. SSH Tunnels
+    local ssh_count=$(ls /etc/systemd/system/iranbax-ssh-*.service 2>/dev/null | wc -l)
+    if [[ $ssh_count -gt 0 ]]; then
+        status_line+="${BLUE}[SSH: ${ssh_count} Active]${NC} "
+        active_found=true
+    fi
+
     if [[ "$active_found" == "false" ]]; then
-        status_line="${WHITE}No active Xray tunnels configured.${NC}"
+        status_line="${WHITE}No active tunnels configured.${NC}"
     fi
 
     echo -e "$status_line"
@@ -307,10 +314,11 @@ display_menu() {
     echo ''
     echo -e "${CYAN}1. Xray Relay Management (V2ray Config/Link)${NC}"
     echo -e "${MAGENTA}2. Xray-Reality Management (Stealth TCP)${NC}"
-    echo -e "${YELLOW}3. Service & System Management (Optimizations, Restarts)${NC}"
-    echo -e "${GREEN}4. Installation Proxy (Setup Helper)${NC}"
-    echo -e "${RED}5. Remove All Tunnels & Cleanup${NC}"
-    echo -e "6. Update Script"
+    echo -e "${BLUE}3. SSH Tunnel Management (Simple TCP Forwarding)${NC}"
+    echo -e "${YELLOW}4. Service & System Management (Optimizations, Restarts)${NC}"
+    echo -e "${GREEN}5. Installation Proxy (Setup Helper)${NC}"
+    echo -e "${RED}6. Remove All Tunnels & Cleanup${NC}"
+    echo -e "7. Update Script"
     echo -e "0. Exit"
     echo ''
     echo "-------------------------------"
@@ -559,108 +567,114 @@ manage_xray_relay() {
 
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
+# URL decode helper
+urldecode() {
+    local data="${1//+/ }"
+    printf '%b' "${data//%/\\x}"
+}
+
 parse_vmess_link() {
     local link=$1
     local body=$(echo "$link" | sed 's/vmess:\/\///')
     local decoded=$(echo "$body" | base64 -d 2>/dev/null)
-    if [[ -z "$decoded" ]]; then return 1; fi
+    [[ -z "$decoded" ]] && return 1
 
-    local uuid=$(echo "$decoded" | jq -r '.id')
-    local host=$(echo "$decoded" | jq -r '.add')
-    local port=$(echo "$decoded" | jq -r '.port')
-    local aid=$(echo "$decoded" | jq -r '.aid // 0')
-    local net_type=$(echo "$decoded" | jq -r '.net')
-    local path=$(echo "$decoded" | jq -r '.path // "/"')
-    local sni=$(echo "$decoded" | jq -r '.sni // empty')
-    [[ -z "$sni" || "$sni" == "null" ]] && sni=$(echo "$decoded" | jq -r '.host // empty')
-    [[ -z "$sni" || "$sni" == "null" ]] && sni="$host"
-    local tls_type=$(echo "$decoded" | jq -r '.tls')
-    local security=$(echo "$decoded" | jq -r '.scy // "auto"')
-    local alpn=$(echo "$decoded" | jq -r '.alpn // empty')
-
-    jq -n \
-        --arg uuid "$uuid" \
-        --arg host "$host" \
-        --arg port "$port" \
-        --argjson aid "$aid" \
-        --arg net "${net_type:-tcp}" \
-        --arg path "${path:-/}" \
-        --arg sni "$sni" \
-        --arg tls "$tls_type" \
-        --arg scy "$security" \
-        --arg alpn "$alpn" \
-        '{
+    jq -c --argjson d "$decoded" '
+        {
             "protocol": "vmess",
             "settings": {
-                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "alterId": $aid, "security": $scy}]}]
+                "vnext": [{
+                    "address": ($d.add | tostring),
+                    "port": ($d.port | tonumber),
+                    "users": [{
+                        "id": ($d.id | tostring),
+                        "alterId": ($d.aid | tonumber // 0),
+                        "security": ($d.scy // "auto")
+                    }]
+                }]
             },
             "streamSettings": {
-                "network": $net,
-                "security": (if $tls == "tls" then "tls" else "none" end),
-                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+                "network": ($d.net // "tcp"),
+                "security": (if $d.tls == "tls" then "tls" else "none" end),
+                "tlsSettings": (if $d.tls == "tls" then {
+                    "serverName": ($d.sni // $d.host // $d.add),
+                    "allowInsecure": true,
+                    "alpn": (if $d.alpn != null and $d.alpn != "" then ($d.alpn | split(",")) else ["h2", "http/1.1"] end)
+                } else null end),
+                "wsSettings": (if $d.net == "ws" then {
+                    "path": ($d.path // "/"),
+                    "headers": {"Host": ($d.host // $d.sni // $d.add)}
+                } else null end)
             }
-        } | del(..|nulls)'
+        } | del(..|nulls)' 2>/dev/null
 }
 
 parse_vless_link() {
     local link=$1
-    # Basic robust parser for vless://uuid@host:port?params#tag
     local body=$(echo "$link" | sed 's/vless:\/\///')
     local uuid=$(echo "$body" | awk -F'@' '{print $1}')
     local rest=$(echo "$body" | awk -F'@' '{print $2}')
     local host_port=$(echo "$rest" | awk -F'?' '{print $1}')
-    local params=$(echo "$rest" | awk -F'?' '{print $2}' | awk -F'#' '{print $1}')
+    local params_str=$(echo "$rest" | awk -F'?' '{print $2}' | awk -F'#' '{print $1}')
     local host=$(echo "$host_port" | awk -F':' '{print $1}')
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
 
-    # Function to extract param value
-    get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g'; }
-
-    local type=$(get_p "type")
-    local security=$(get_p "security")
-    local sni=$(get_p "sni")
-    [[ -z "$sni" ]] && sni=$(get_p "peer")
-    [[ -z "$sni" ]] && sni=$(get_p "host")
-    [[ -z "$sni" ]] && sni="$host"
-    local path=$(get_p "path")
-    local flow=$(get_p "flow")
-    local fp=$(get_p "fp")
-    local alpn=$(get_p "alpn")
-    local insecure=$(get_p "insecure")
-    [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
-    local ws_host=$(get_p "host")
-    [[ -z "$ws_host" ]] && ws_host="$sni"
-
-    local allow_ins=false
-    [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
+    # Extract params into a JSON object for easier handling
+    local params_json=$(echo "$params_str" | sed 's/&/\n/g' | jq -R -s '
+        split("\n") | map(select(length > 0) | split("=")) | map({(.[0]): .[1]}) | add
+    ')
 
     jq -n \
         --arg uuid "$uuid" \
         --arg host "$host" \
         --arg port "$port" \
-        --arg type "${type:-tcp}" \
-        --arg security "${security:-none}" \
-        --arg sni "$sni" \
-        --arg path "${path:-/}" \
-        --arg flow "$flow" \
-        --arg fp "${fp:-chrome}" \
-        --arg alpn "$alpn" \
-        --arg ws_host "$ws_host" \
-        --argjson allow_ins "$allow_ins" \
-        '{
+        --argjson p "$params_json" \
+        '
+        def get_p(k; d): ($p[k] // d);
+        def decode(s): (if s != null then s | sub("%2F"; "/"; "g") | sub("%2B"; "+"; "g") else null end);
+
+        ($p["type"] // "tcp") as $type |
+        ($p["security"] // "none") as $sec |
+        (decode($p["sni"] // $p["peer"] // $p["host"]) // $host) as $sni |
+        (decode($p["path"]) // "/") as $path |
+        (decode($p["host"]) // $sni) as $ws_host |
+        ($p["insecure"] == "1" or $p["allowInsecure"] == "1" or $p["insecure"] == "true") as $allow_ins |
+
+        {
             "protocol": "vless",
             "settings": {
-                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "encryption": "none", "flow": (if $flow != "" then $flow else null end)}]}]
+                "vnext": [{
+                    "address": $host,
+                    "port": ($port|tonumber),
+                    "users": [{
+                        "id": $uuid,
+                        "encryption": "none",
+                        "flow": (if $p["flow"] != "" and $p["flow"] != null then $p["flow"] else null end)
+                    }]
+                }]
             },
             "streamSettings": {
                 "network": $type,
-                "security": $security,
-                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end)
+                "security": $sec,
+                "tlsSettings": (if $sec == "tls" then {
+                    "serverName": $sni,
+                    "fingerprint": ($p["fp"] // "chrome"),
+                    "allowInsecure": $allow_ins,
+                    "alpn": (if $p["alpn"] != null and $p["alpn"] != "" then ($p["alpn"] | decode | split(",")) else ["h2", "http/1.1"] end)
+                } else null end),
+                "realitySettings": (if $sec == "reality" then {
+                    "serverName": $sni,
+                    "fingerprint": ($p["fp"] // "chrome"),
+                    "publicKey": $p["pbk"],
+                    "shortId": $p["sid"],
+                    "spiderX": (decode($p["spx"]) // "/")
+                } else null end),
+                "wsSettings": (if $type == "ws" then {
+                    "path": $path,
+                    "headers": {"Host": $ws_host}
+                } else null end)
             }
-        } | del(..|nulls)'
+        } | del(..|nulls)' 2>/dev/null
 }
 
 setup_xray_relay() {
@@ -740,6 +754,8 @@ activate_relay() {
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
     local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.redirect // 0' | awk -F':' '{print $NF}')
+    [[ -z "$remote_port" || "$remote_port" == "0" || "$remote_port" == "null" ]] && remote_port=2053
+
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
@@ -845,9 +861,33 @@ EOF
     systemctl restart "$XRAY_RELAY_SERVICE"
 
     echo -e "${CYAN}Checking service status...${NC}"
-    sleep 2
+    sleep 3
     if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
         echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
+
+        if [[ "$in_proto_choice" == "3" ]]; then
+            local my_ip=$(get_public_ip | awk '{print $1}')
+            echo -e "\n${YELLOW}--- Client Configuration ---${NC}"
+            echo -e "Use these settings in your V2ray client to connect to this Iran server:"
+            echo -e "${WHITE}Address:${NC} $my_ip"
+            echo -e "${WHITE}Port:${NC} $iran_port"
+            echo -e "${WHITE}Protocol:${NC} $proto"
+            [[ -n "$id" ]] && echo -e "${WHITE}UUID:${NC} $id"
+            echo -e "${WHITE}Transport:${NC} TCP (Plain)"
+            echo -e "${WHITE}Security:${NC} None"
+
+            # Generate a link
+            local link=""
+            if [[ "$proto" == "vless" ]]; then
+                link="vless://${id}@${my_ip}:${iran_port}?encryption=none&security=none&type=tcp#Iranbax_${name}"
+            elif [[ "$proto" == "vmess" ]]; then
+                local v_json=$(jq -n --arg add "$my_ip" --arg port "$iran_port" --arg id "$id" --arg ps "Iranbax_${name}" \
+                    '{"v":"2","ps":$ps,"add":$add,"port":$port,"id":$id,"aid":"0","scy":"auto","net":"tcp","type":"none","host":"","path":"","tls":"","sni":"","alpn":"","fp":""}')
+                link="vmess://$(echo -n "$v_json" | base64 -w 0)"
+            fi
+            [[ -n "$link" ]] && echo -e "\n${CYAN}Import Link:${NC}\n$link"
+        fi
+
         # End-to-end check
         echo -e "${CYAN}Performing end-to-end connectivity test...${NC}"
         local test_cmd="curl -L --connect-timeout 5 -s -o /dev/null -w \"%{http_code}\""
@@ -876,7 +916,8 @@ EOF
         fi
     else
         echo -e "${RED}[✘] Failed to start Xray Relay service.${NC}"
-        echo -e "${YELLOW}Check logs with: journalctl -u $XRAY_RELAY_SERVICE -n 50${NC}"
+        echo -e "${YELLOW}Fetching last 20 lines of logs for $XRAY_RELAY_SERVICE:${NC}"
+        journalctl -u "$XRAY_RELAY_SERVICE" -n 20 --no-pager
     fi
     sleep 3
 }
@@ -1118,7 +1159,15 @@ EOF
     systemctl daemon-reload
     systemctl enable "$XRAY_SERVICE"
     systemctl restart "$XRAY_SERVICE"
-    echo -e "${GREEN}Xray-Reality service started!${NC}"
+    echo -e "${CYAN}Checking service status...${NC}"
+    sleep 3
+    if systemctl is-active --quiet "$XRAY_SERVICE"; then
+        echo -e "${GREEN}Xray-Reality service started!${NC}"
+    else
+        echo -e "${RED}[✘] Failed to start Xray-Reality service.${NC}"
+        echo -e "${YELLOW}Fetching last 20 lines of logs for $XRAY_SERVICE:${NC}"
+        journalctl -u "$XRAY_SERVICE" -n 20 --no-pager
+    fi
     sleep 2
 }
 
@@ -1357,6 +1406,14 @@ cleanup_all() {
     systemctl stop "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
     systemctl disable "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
 
+    # SSH tunnels
+    local ssh_services=$(ls /etc/systemd/system/iranbax-ssh-*.service 2>/dev/null)
+    for s in $ssh_services; do
+        systemctl stop "$(basename "$s")" 2>/dev/null
+        systemctl disable "$(basename "$s")" 2>/dev/null
+        rm -f "$s"
+    done
+
     # Remove systemd files
     rm -f "/etc/systemd/system/${XRAY_SERVICE}" "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 
@@ -1416,18 +1473,117 @@ update_script() {
     sleep 2
 }
 
+manage_ssh_tunnels() {
+    while true; do
+        clear
+        display_logo
+        echo -e "${BLUE}--- SSH Tunnel Management ---${NC}"
+        echo -e "1. Create New SSH Tunnel (Local Forwarding: Iran -> Kharej)"
+        echo -e "2. List & Stop Active SSH Tunnels"
+        echo -e "3. Back"
+        echo ''
+        read_num "Choice: " "ssh_t_choice" 1 3
+        case $ssh_t_choice in
+            1) create_ssh_tunnel ;;
+            2) list_ssh_tunnels ;;
+            3) break ;;
+        esac
+    done
+}
+
+create_ssh_tunnel() {
+    clear
+    display_logo
+    echo -e "${BLUE}--- Create SSH Tunnel ---${NC}"
+    echo -e "This uses 'ssh -L' to forward an Iran port to a Kharej port."
+    echo ''
+    read_ip "Enter KHAREJ Server IP: " "kharej_ip"
+    read -p "Enter SSH Username (default: root): " kharej_user
+    kharej_user=${kharej_user:-root}
+    read_port "Enter KHAREJ SSH Port (default: 22): " "kharej_ssh_port" "false" 22
+    read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
+    read_port "Enter KHAREJ Target Port (e.g., 2053): " "kharej_target_port" "false" 2053
+
+    echo -e "\n${YELLOW}Setting up Auth Keys...${NC}"
+    setup_proxy_keys "$kharej_ip" "$kharej_user" "$kharej_ssh_port"
+
+    local service_name="iranbax-ssh-${iran_port}.service"
+    cat << EOF > "/etc/systemd/system/${service_name}"
+[Unit]
+Description=SSH Tunnel Iran:${iran_port} -> Kharej:${kharej_target_port}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -L 0.0.0.0:${iran_port}:127.0.0.1:${kharej_target_port} -N -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -p ${kharej_ssh_port} ${kharej_user}@${kharej_ip}
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$service_name"
+    systemctl restart "$service_name"
+
+    sleep 2
+    if systemctl is-active --quiet "$service_name"; then
+        echo -e "${GREEN}SSH Tunnel established! Iran:${iran_port} is now bridged to Kharej:${kharej_target_port}${NC}"
+    else
+        echo -e "${RED}Failed to start SSH Tunnel service.${NC}"
+        journalctl -u "$service_name" -n 10 --no-pager
+    fi
+    sleep 2
+}
+
+list_ssh_tunnels() {
+    clear
+    display_logo
+    echo -e "${BLUE}--- Active SSH Tunnels ---${NC}"
+    local services=$(ls /etc/systemd/system/iranbax-ssh-*.service 2>/dev/null)
+    if [[ -z "$services" ]]; then
+        echo -e "${RED}No active SSH tunnels found.${NC}"
+        sleep 1
+        return
+    fi
+
+    local i=1
+    local s_names=()
+    for s in $services; do
+        local name=$(basename "$s")
+        local status=$(systemctl is-active "$name")
+        echo -e "$i. $name [$status]"
+        s_names+=("$name")
+        ((i++))
+    done
+    echo "$i. Back"
+
+    read_num "Choose a tunnel to stop (0 for none): " "s_idx" 0 $i
+    [[ $s_idx -eq 0 || $s_idx -eq $i ]] && return
+
+    local selected="${s_names[$((s_idx-1))]}"
+    systemctl stop "$selected"
+    systemctl disable "$selected"
+    rm -f "/etc/systemd/system/$selected"
+    systemctl daemon-reload
+    echo -e "${GREEN}Tunnel stopped and removed.${NC}"
+    sleep 1
+}
+
 # Main loop
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 while true; do
     display_menu
-    read_num "Enter your choice: " "choice" 0 6
+    read_num "Enter your choice: " "choice" 0 7
     case $choice in
         1) manage_xray_relay ;;
         2) manage_xray_reality ;;
-        3) manage_services ;;
-        4) installation_proxy ;;
-        5) cleanup_all ;;
-        6) update_script ;;
+        3) manage_ssh_tunnels ;;
+        4) manage_services ;;
+        5) installation_proxy ;;
+        6) cleanup_all ;;
+        7) update_script ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
     esac
