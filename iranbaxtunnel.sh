@@ -672,6 +672,11 @@ parse_vless_link() {
                 "wsSettings": (if $type == "ws" then {
                     "path": $path,
                     "headers": {"Host": $ws_host}
+                } else null end),
+                "xhttpSettings": (if $type == "xhttp" then {
+                    "path": $path,
+                    "host": $ws_host,
+                    "mode": ($p["mode"] // "auto")
                 } else null end)
             }
         } | del(..|nulls)' 2>/dev/null
@@ -699,18 +704,20 @@ setup_xray_relay() {
              echo -e "${YELLOW}Converting flat JSON to standard Xray outbound...${NC}"
              outbound=$(echo "$outbound" | jq '
                 if .protocol == "vless" or .protocol == "vmess" then
-                    .settings = {
-                        "vnext": [{
-                            "address": (.settings.address | tostring),
-                            "port": (.settings.port | tonumber),
-                            "users": [{
-                                "id": ((.settings.id // .settings.users[0].id) | tostring),
-                                "encryption": ((.settings.encryption // "none") | tostring),
-                                "flow": ((.settings.flow // "") | tostring),
-                                "security": ((.settings.security // "auto") | tostring)
+                    if .settings.address then
+                        .settings = {
+                            "vnext": [{
+                                "address": (.settings.address | tostring),
+                                "port": (.settings.port | tonumber),
+                                "users": [{
+                                    "id": ((.settings.id // .settings.users[0].id) | tostring),
+                                    "encryption": ((.settings.encryption // "none") | tostring),
+                                    "flow": ((.settings.flow // "") | tostring),
+                                    "security": ((.settings.security // "auto") | tostring)
+                                }]
                             }]
-                        }]
-                    }
+                        }
+                    else . end
                 else . end
              ')
         fi
@@ -753,9 +760,12 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
+    local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.redirect // empty' | cut -d':' -f1)
     local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.redirect // 0' | awk -F':' '{print $NF}')
     [[ -z "$remote_port" || "$remote_port" == "0" || "$remote_port" == "null" ]] && remote_port=2053
 
+    local security=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
+    local transport=$(echo "$outbound" | jq -r '.streamSettings.network // "tcp"')
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
@@ -763,9 +773,9 @@ activate_relay() {
     local in_proto_choice=1
     if [[ "$proto" != "freedom" ]]; then
         echo -e "\nChoose Entry Protocol for Iran Server:"
-        echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels)"
-        echo -e "2. SOCKS5 + HTTP Proxy"
-        echo -e "3. ${proto^^} Relay (UUID validation enabled)"
+        echo -e "1. Bridge Mode (Simple Forwarding - Use original link on phone)"
+        echo -e "2. SOCKS5 + HTTP Proxy (Use as proxy in Apps/Phone)"
+        echo -e "3. ${proto^^} Relay (UUID Protected - Generate new link for phone)"
         read_num "Choice (default: 1): " "in_proto_choice" 1 3
     else
         echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
@@ -773,63 +783,75 @@ activate_relay() {
     fi
     in_proto_choice=${in_proto_choice:-1}
 
-    local inbound_json=""
+    local final_json=""
     case $in_proto_choice in
         1)
-            # Bridge Mode: Dokodemo-door
-            inbound_json=$(jq -n --argjson p "$iran_port" --argjson rp "$remote_port" '{
-                "port": $p,
-                "protocol": "dokodemo-door",
-                "settings": { "address": "127.0.0.1", "port": $rp, "network": "tcp,udp" },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
-                "tag": "inbound-bridge"
-            }')
-            ;;
-        2)
-            # SOCKS Mode
-            inbound_json=$(jq -n --argjson p "$iran_port" '{
-                "port": $p,
-                "protocol": "socks",
-                "settings": { "auth": "noauth", "udp": true },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
-                "tag": "inbound-socks"
-            }')
-            ;;
-        3)
-            # Protocol specific
-            if [[ "$proto" == "vless" ]]; then
-                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
-                    "port": $p,
-                    "protocol": "vless",
-                    "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
-                    "tag": "inbound-vless"
+            # Bridge Mode: If config is encrypted, we must just forward RAW bits
+            if [[ "$security" != "none" || "$transport" != "tcp" ]]; then
+                echo -e "${YELLOW}Detected encrypted/complex tunnel. Using Simple Transparent Bridge.${NC}"
+                final_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '
+                {
+                    "log": { "loglevel": "warning" },
+                    "inbounds": [{
+                        "port": $p,
+                        "protocol": "dokodemo-door",
+                        "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" }
+                    }],
+                    "outbounds": [{ "protocol": "freedom" }]
                 }')
-            elif [[ "$proto" == "vmess" ]]; then
-                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
-                    "port": $p,
-                    "protocol": "vmess",
-                    "settings": { "clients": [ { "id": $id } ] },
-                    "tag": "inbound-vmess"
+            else
+                # Plain TCP config, we can use the outbound as-is
+                final_json=$(jq -n --argjson p "$iran_port" --argjson outb "$outbound" '
+                {
+                    "log": { "loglevel": "warning" },
+                    "inbounds": [{
+                        "port": $p,
+                        "protocol": "dokodemo-door",
+                        "settings": { "address": "127.0.0.1", "port": 0, "network": "tcp,udp" },
+                        "tag": "in"
+                    }],
+                    "outbounds": [($outb | .tag = "out")],
+                    "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
                 }')
             fi
             ;;
+        2)
+            # SOCKS Mode
+            final_json=$(jq -n --argjson p "$iran_port" --argjson outb "$outbound" '
+            {
+                "log": { "loglevel": "warning" },
+                "inbounds": [{
+                    "port": $p,
+                    "protocol": "socks",
+                    "settings": { "auth": "noauth", "udp": true },
+                    "tag": "in"
+                }],
+                "outbounds": [($outb | .tag = "out")],
+                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
+            }')
+            ;;
+        3)
+            # Protocol specific Relay
+            local inbound_proto="$proto"
+            local inbound_settings="{ \"clients\": [ { \"id\": \"$id\" } ] }"
+            [[ "$proto" == "vless" ]] && inbound_settings="{ \"clients\": [ { \"id\": \"$id\" } ], \"decryption\": \"none\" }"
+
+            final_json=$(jq -n --argjson p "$iran_port" --arg pr "$inbound_proto" --argjson ps "$inbound_settings" --argjson outb "$outbound" '
+            {
+                "log": { "loglevel": "warning" },
+                "inbounds": [{
+                    "port": $p,
+                    "protocol": $pr,
+                    "settings": $ps,
+                    "tag": "in"
+                }],
+                "outbounds": [($outb | .tag = "out")],
+                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "out", "type": "field" }] }
+            }')
+            ;;
     esac
 
-    # Safe JSON assembly using jq
-    jq -n \
-        --argjson inb "$inbound_json" \
-        --argjson outb "$outbound" \
-        '{
-          "log": { "loglevel": "warning" },
-          "inbounds": [$inb],
-          "outbounds": [($outb | .tag = "outbound-relay")],
-          "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-              { "type": "field", "inboundTag": ["inbound-bridge", "inbound-socks", "inbound-vless", "inbound-vmess"], "outboundTag": "outbound-relay" }
-            ]
-          }
-        } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
+    echo "$final_json" | jq 'del(..|nulls)' > "$XRAY_RELAY_CONFIG"
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
@@ -916,7 +938,9 @@ EOF
         fi
     else
         echo -e "${RED}[✘] Failed to start Xray Relay service.${NC}"
-        echo -e "${YELLOW}Fetching last 20 lines of logs for $XRAY_RELAY_SERVICE:${NC}"
+        echo -e "${YELLOW}Generated Configuration ($XRAY_RELAY_CONFIG):${NC}"
+        cat "$XRAY_RELAY_CONFIG"
+        echo -e "\n${YELLOW}Fetching last 20 lines of logs for $XRAY_RELAY_SERVICE:${NC}"
         journalctl -u "$XRAY_RELAY_SERVICE" -n 20 --no-pager
     fi
     sleep 3
