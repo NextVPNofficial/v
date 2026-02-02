@@ -22,8 +22,9 @@ CONFIG_DIR="/root/iranbaxtunnel"
 RATHOLE_CORE_DIR="${CONFIG_DIR}/rathole-core"
 XRAY_CORE_DIR="${CONFIG_DIR}/xray-core"
 SAVED_PROXIES_FILE="${CONFIG_DIR}/saved_proxies.txt"
+SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" "$SAVED_RELAYS_DIR"
 fi
 
 # --- Input Validation Logic ---
@@ -202,7 +203,7 @@ get_tunnel_status() {
             local tunnel_port=$(grep "bind_addr" "$IRAN_RATHOLE_CONFIG" | head -n1 | awk -F':' '{print $NF}' | tr -d '"')
             check="${GREEN}LISTENING:${tunnel_port}${NC}"
         fi
-        status_line+="${YELLOW}[Rathole Server: ${check}]${NC} "
+        status_line+="${YELLOW}[RH-Server: ${check}]${NC} "
         active_found=true
     fi
     for config in ${CONFIG_DIR}/rathole_client_s[0-9]*.toml; do
@@ -215,7 +216,7 @@ get_tunnel_status() {
             if systemctl is-active --quiet "$svc"; then
                 if ping -c 1 -W 1 "$remote_ip" &>/dev/null; then check="${GREEN}ONLINE${NC}"; else check="${YELLOW}CONNECTING${NC}"; fi
             fi
-            status_line+="${CYAN}[Rathole: ${remote} (${check})]${NC} "
+            status_line+="${CYAN}[RH: ${remote} (${check})]${NC} "
             active_found=true
         fi
     done
@@ -271,6 +272,7 @@ get_tunnel_status() {
     # 5. Xray-Relay
     if [[ -f "/etc/systemd/system/${XRAY_RELAY_SERVICE}" ]]; then
         local check="${RED}STOPPED${NC}"
+        local relay_name=$(grep -oP 'Description=Xray Relay Tunnel \(\K[^\)]+' "/etc/systemd/system/${XRAY_RELAY_SERVICE}")
         if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
             check="${GREEN}ONLINE${NC}"
             local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_RELAY_CONFIG" | head -n1)
@@ -278,7 +280,7 @@ get_tunnel_status() {
                 check="${GREEN}WORKS:${iran_port}${NC}"
             fi
         fi
-        status_line+="${CYAN}[XrayRelay: ${check}]${NC} "
+        status_line+="${CYAN}[Relay(${relay_name:-Imported}): ${check}]${NC} "
         active_found=true
     fi
 
@@ -320,6 +322,8 @@ get_proxy_status() {
 display_topbar() {
     local current_ip=$(get_public_ip)
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}              ${MAGENTA}🛰️  IRANBAX TUNNELING SYSTEM - STATUS DASHBOARD${NC}                          ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${BLUE}║${NC} ${YELLOW}System Exit IP:   ${NC} ${CYAN}${current_ip}${NC}"
     echo -n -e "${BLUE}║${NC} ${YELLOW}Active Tunnels:   ${NC} "
     get_tunnel_status
@@ -339,9 +343,9 @@ ____________ _/  |_|  |__   ____ |  |   ____
             \/          \/                 \/
 EOF
     echo -e "${NC}${GREEN}"
-    echo -e "${YELLOW}Unified IRANBAX Tunneling System${GREEN}"
-    echo -e "Version: ${YELLOW}v2.0.0${GREEN}"
-    echo -e "Features: Rathole, SIT/GRE, SSH Tunneling${NC}"
+    echo -e "${YELLOW}IRANBAX Tunneling System${GREEN}"
+    echo -e "Version: ${YELLOW}v2.1.0${GREEN}"
+    echo -e "Features: Xray-Relay, Reality, ShadowTLS, Rathole, SIT/GRE, SSH${NC}"
 }
 
 # Function to display main menu
@@ -769,41 +773,153 @@ manage_xray_reality() {
 }
 
 manage_xray_relay() {
-    clear
-    display_logo
-    echo -e "${CYAN}--- Xray Relay Management (Import V2ray) ---${NC}"
-    echo -e "1. Install Xray-core"
-    echo -e "2. Setup Relay from JSON Outbound"
-    echo -e "3. Back"
-    echo ''
-    read_num "Choose an option: " "xr_choice" 1 3
-    case $xr_choice in
-        1) install_xray_menu ;;
-        2) setup_xray_relay ;;
-        *) return ;;
-    esac
+    while true; do
+        clear
+        display_logo
+        echo -e "${CYAN}--- Xray Relay Management (Import V2ray) ---${NC}"
+        echo -e "1. Install Xray-core"
+        echo -e "2. Import New Relay (JSON or Link)"
+        echo -e "3. Saved Relays (List, Connect, Edit, Delete)"
+        echo -e "4. Back"
+        echo ''
+        read_num "Choose an option: " "xr_choice" 1 4
+        case $xr_choice in
+            1) install_xray_menu ;;
+            2) setup_xray_relay ;;
+            3) saved_relays_menu ;;
+            *) return ;;
+        esac
+    done
 }
 
 XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
+parse_vmess_link() {
+    local link=$1
+    local body=$(echo "$link" | sed 's/vmess:\/\///')
+    local decoded=$(echo "$body" | base64 -d 2>/dev/null)
+    if [[ -z "$decoded" ]]; then return 1; fi
+
+    local uuid=$(echo "$decoded" | jq -r '.id')
+    local host=$(echo "$decoded" | jq -r '.add')
+    local port=$(echo "$decoded" | jq -r '.port')
+    local security=$(echo "$decoded" | jq -r '.scy // "auto"')
+    local net_type=$(echo "$decoded" | jq -r '.net')
+    local path=$(echo "$decoded" | jq -r '.path')
+    local sni=$(echo "$decoded" | jq -r '.sni // .host')
+    local tls_type=$(echo "$decoded" | jq -r '.tls')
+
+    jq -n \
+        --arg uuid "$uuid" \
+        --arg host "$host" \
+        --arg port "$port" \
+        --arg security "$security" \
+        --arg sni "$sni" \
+        --arg net_type "$net_type" \
+        --arg path "$path" \
+        --arg tls_type "$tls_type" \
+        '{
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "security": $security}]}]
+            },
+            "streamSettings": {
+                "network": $net_type,
+                "security": (if $tls_type == "tls" then "tls" else "none" end),
+                "tlsSettings": (if $tls_type == "tls" then {"serverName": $sni} else null end),
+                "wsSettings": (if $net_type == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+            }
+        }'
+}
+
+parse_vless_link() {
+    local link=$1
+    # Very basic parser for vless://uuid@host:port?params#tag
+    local body=$(echo "$link" | sed 's/vless:\/\///')
+    local tag=$(echo "$body" | grep -o '#.*' | sed 's/#//')
+    local rest=$(echo "$body" | sed 's/#.*//')
+    local uuid=$(echo "$rest" | awk -F'@' '{print $1}')
+    local host_port_params=$(echo "$rest" | awk -F'@' '{print $2}')
+    local host_port=$(echo "$host_port_params" | awk -F'?' '{print $1}')
+    local params=$(echo "$host_port_params" | awk -F'?' '{print $2}')
+    local host=$(echo "$host_port" | awk -F':' '{print $1}')
+    local port=$(echo "$host_port" | awk -F':' '{print $2}')
+
+    # Extract common params
+    local security=$(echo "$params" | grep -o 'security=[^&]*' | cut -d'=' -f2)
+    local sni=$(echo "$params" | grep -o 'sni=[^&]*' | cut -d'=' -f2)
+    local type=$(echo "$params" | grep -o 'type=[^&]*' | cut -d'=' -f2)
+    local path=$(echo "$params" | grep -o 'path=[^&]*' | cut -d'=' -f2 | sed 's/%2F/\//g')
+    local flow=$(echo "$params" | grep -o 'flow=[^&]*' | cut -d'=' -f2)
+
+    jq -n \
+        --arg uuid "$uuid" \
+        --arg host "$host" \
+        --arg port "$port" \
+        --arg security "${security:-none}" \
+        --arg sni "$sni" \
+        --arg type "${type:-tcp}" \
+        --arg path "$path" \
+        --arg flow "$flow" \
+        '{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{"address": $host, "port": ($port|tonumber), "users": [{"id": $uuid, "encryption": "none", "flow": $flow}]}]
+            },
+            "streamSettings": {
+                "network": $type,
+                "security": $security,
+                "tlsSettings": (if $security == "tls" then {"serverName": $sni} else null end),
+                "realitySettings": (if $security == "reality" then {"serverName": $sni} else null end),
+                "wsSettings": (if $type == "ws" then {"path": $path} else null end)
+            }
+        }'
+}
+
 setup_xray_relay() {
     if [[ ! -f "$XRAY_BIN" ]]; then echo -e "${RED}Install Xray-core first!${NC}"; sleep 1; return; fi
 
-    echo -e "${YELLOW}Paste your Xray Outbound JSON object (including { }):${NC}"
-    echo -e "Example: { \"protocol\": \"vless\", \"settings\": { ... }, \"streamSettings\": { ... }, \"tag\": \"proxy\" }"
+    echo -e "${YELLOW}Paste your Xray Outbound JSON or VLESS Link:${NC}"
     echo -e "Press Ctrl+D when finished."
 
-    local outbound=$(cat)
-    if [[ -z "$outbound" ]]; then echo -e "${RED}No input received.${NC}"; sleep 1; return; fi
+    local input=$(cat)
+    if [[ -z "$input" ]]; then echo -e "${RED}No input received.${NC}"; sleep 1; return; fi
 
-    # Check if jq can parse it
-    if ! echo "$outbound" | jq . >/dev/null 2>&1; then
-        echo -e "${RED}Error: Invalid JSON format.${NC}"
+    local outbound=""
+    if [[ "$input" == vless://* ]]; then
+        outbound=$(parse_vless_link "$input")
+    elif [[ "$input" == vmess://* ]]; then
+        outbound=$(parse_vmess_link "$input")
+    elif echo "$input" | jq . >/dev/null 2>&1; then
+        outbound="$input"
+    else
+        echo -e "${RED}Error: Invalid format. Only JSON or vless:// links are supported currently.${NC}"
         sleep 2
         return
     fi
 
+    local random_name="relay_$(openssl rand -hex 4)"
+    read -p "Enter a name for this config (default: $random_name): " relay_name
+    relay_name=${relay_name:-$random_name}
+    relay_name=$(echo "$relay_name" | sed 's/[^a-zA-Z0-9_]/_/g')
+
+    echo "$outbound" > "${SAVED_RELAYS_DIR}/${relay_name}.json"
+    echo -e "${GREEN}Saved as $relay_name!${NC}"
+    sleep 1
+
+    read -p "Do you want to connect to this relay now? (y/n): " connect_now
+    if [[ "$connect_now" == "y" ]]; then
+        activate_relay "$relay_name"
+    fi
+}
+
+activate_relay() {
+    local name=$1
+    local config_file="${SAVED_RELAYS_DIR}/${name}.json"
+    if [[ ! -f "$config_file" ]]; then echo -e "${RED}Config $name not found!${NC}"; return; fi
+
+    local outbound=$(cat "$config_file")
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
     cat << EOF > "$XRAY_RELAY_CONFIG"
@@ -825,7 +941,7 @@ EOF
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
-Description=Xray Relay Tunnel (Iranbax)
+Description=Xray Relay Tunnel ($name)
 After=network.target
 
 [Service]
@@ -842,8 +958,103 @@ EOF
     systemctl daemon-reload
     systemctl enable "$XRAY_RELAY_SERVICE"
     systemctl restart "$XRAY_RELAY_SERVICE"
-    echo -e "${GREEN}Xray Relay started on port $iran_port!${NC}"
+    echo -e "${GREEN}Xray Relay ($name) started on port $iran_port!${NC}"
     sleep 2
+}
+
+saved_relays_menu() {
+    while true; do
+        local files=(${SAVED_RELAYS_DIR}/*.json)
+        if [[ ! -e "${files[0]}" ]]; then
+            echo -e "${RED}No saved relays found.${NC}"
+            sleep 1
+            return
+        fi
+
+        clear
+        display_logo
+        echo -e "${CYAN}--- Saved Xray Relays ---${NC}"
+        local i=1
+        local names=()
+        for f in "${files[@]}"; do
+            local name=$(basename "$f" .json)
+            echo "$i. $name"
+            names+=("$name")
+            ((i++))
+        done
+        echo "$i. Back"
+
+        read_num "Choose a relay: " "r_idx" 1 $i
+        if [[ $r_idx -eq $i ]]; then break; fi
+
+        local selected="${names[$((r_idx-1))]}"
+
+        echo -e "\n${YELLOW}Selected: $selected${NC}"
+        echo "1. Connect (Activate)"
+        echo "2. Edit (Address/Host/Port)"
+        echo "3. Rename"
+        echo "4. Delete"
+        echo "5. Back"
+        read_num "Choose action: " "a_idx" 1 5
+
+        case $a_idx in
+            1) activate_relay "$selected"; return ;;
+            2) edit_relay "$selected" ;;
+            3)
+               read -p "Enter new name: " new_name
+               if [[ -n "$new_name" ]]; then
+                   mv "${SAVED_RELAYS_DIR}/${selected}.json" "${SAVED_RELAYS_DIR}/${new_name}.json"
+                   echo -e "${GREEN}Renamed.${NC}"; sleep 1
+               fi
+               ;;
+            4)
+               rm "${SAVED_RELAYS_DIR}/${selected}.json"
+               echo -e "${RED}Deleted.${NC}"; sleep 1
+               ;;
+            *) continue ;;
+        esac
+    done
+}
+
+edit_relay() {
+    local name=$1
+    local file="${SAVED_RELAYS_DIR}/${name}.json"
+
+    clear
+    echo -e "${YELLOW}Editing $name...${NC}"
+    local current_addr=$(jq -r '.settings.vnext[0].address // empty' "$file")
+    local current_port=$(jq -r '.settings.vnext[0].port // empty' "$file")
+    local current_host=$(jq -r '.streamSettings.wsSettings.headers.Host // .streamSettings.tlsSettings.serverName // empty' "$file")
+
+    echo -e "1. Change Remote Address (currently: ${current_addr:-N/A})"
+    echo -e "2. Change Remote Port (currently: ${current_port:-N/A})"
+    echo -e "3. Change Host/SNI (currently: ${current_host:-N/A})"
+    echo -e "4. Back"
+
+    read_num "Choice: " "e_choice" 1 4
+    case $e_choice in
+        1)
+            read -p "Enter new Address: " n_addr
+            if [[ -n "$n_addr" ]]; then
+                jq --arg a "$n_addr" '.settings.vnext[0].address = $a' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+            fi
+            ;;
+        2)
+            read_port "Enter new Port: " "n_port" "false"
+            jq --argjson p "$n_port" '.settings.vnext[0].port = $p' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+            ;;
+        3)
+            read -p "Enter new Host/SNI: " n_host
+            if [[ -n "$n_host" ]]; then
+                # Update both SNI and WS Host if they exist
+                jq --arg h "$n_host" '
+                    if .streamSettings.tlsSettings then .streamSettings.tlsSettings.serverName = $h else . end |
+                    if .streamSettings.wsSettings then .streamSettings.wsSettings.headers.Host = $h | .streamSettings.wsSettings.host = $h else . end |
+                    if .streamSettings.realitySettings then .streamSettings.realitySettings.serverNames = [$h] else . end
+                ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+            fi
+            ;;
+    esac
 }
 
 setup_xray_reality() {
