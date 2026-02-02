@@ -76,18 +76,56 @@ display_menu() {
     clear
     display_logo
     echo ''
-    echo -e "${CYAN}1. Rathole Tunnel Management${NC}"
-    echo -e "${BLUE}2. SIT/GRE (Tunnel Wizard) Management${NC}"
-    echo -e "${MAGENTA}3. SSH Traffic Tunnel Management${NC}"
-    echo -e "${YELLOW}4. System Optimizations (BBR, Limits)${NC}"
-    echo -e "${GREEN}5. Installation Proxy Settings (Bypass Restrictions)${NC}"
-    echo -e "${RED}6. Remove All Tunnels & Cleanup${NC}"
-    echo -e "7. Check All Tunnel Status"
-    echo -e "8. Restart All Services"
-    echo -e "9. Update Script"
+    echo -e "${CYAN}1. Tunneling Management (Rathole, SIT/GRE, SSH, Status)${NC}"
+    echo -e "${YELLOW}2. Service & System Management (Optimizations, Restarts)${NC}"
+    echo -e "${GREEN}3. Installation Proxy (SSH Reverse for Setup)${NC}"
+    echo -e "${RED}4. Remove All Tunnels & Cleanup${NC}"
+    echo -e "5. Update Script"
     echo -e "0. Exit"
     echo ''
     echo "-------------------------------"
+}
+
+manage_tunnels() {
+    while true; do
+        clear
+        display_logo
+        echo -e "${CYAN}--- Tunneling Management ---${NC}"
+        echo -e "1. Rathole Tunnel"
+        echo -e "2. SIT/GRE (Tunnel Wizard)"
+        echo -e "3. SSH Traffic Tunnel"
+        echo -e "4. Check All Tunnel Status"
+        echo -e "5. Back"
+        echo ''
+        read -p "Choose an option: " t_choice
+        case $t_choice in
+            1) manage_rathole ;;
+            2) manage_sit_gre ;;
+            3) manage_ssh_tunnel ;;
+            4) check_status ;;
+            5) break ;;
+            *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
+        esac
+    done
+}
+
+manage_services() {
+    while true; do
+        clear
+        display_logo
+        echo -e "${YELLOW}--- Service & System Management ---${NC}"
+        echo -e "1. System Optimizations (BBR, Limits)"
+        echo -e "2. Restart All Services"
+        echo -e "3. Back"
+        echo ''
+        read -p "Choose an option: " s_choice
+        case $s_choice in
+            1) system_optimizations ;;
+            2) restart_all ;;
+            3) break ;;
+            *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
+        esac
+    done
 }
 
 # --- Rathole Logic ---
@@ -164,6 +202,7 @@ manage_rathole() {
 }
 
 rathole_iran_config() {
+    check_install_proxy
     if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
     clear
     echo -e "${YELLOW}Configuring IRAN server for Rathole...${NC}"
@@ -230,6 +269,7 @@ EOF
 }
 
 rathole_kharej_config() {
+    check_install_proxy
     if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
     clear
     echo -e "${CYAN}Configuring KHAREJ server for Rathole...${NC}"
@@ -356,6 +396,7 @@ manage_sit_gre() {
 }
 
 setup_sit_gre() {
+    check_install_proxy
     local role=$1
     local main_iface=$2
 
@@ -450,6 +491,7 @@ manage_ssh_tunnel() {
 }
 
 setup_ssh_traffic() {
+    check_install_proxy
     local type=$1
     read -p "Enter Target Server IP: " target_ip
     read -p "Enter SSH Username (default: root): " ssh_user
@@ -588,6 +630,17 @@ clear_proxy() {
     echo -e "${GREEN}Proxy settings cleared.${NC}"
 }
 
+check_install_proxy() {
+    if pgrep -f "ssh -D 1080" > /dev/null; then
+        echo -e "${YELLOW}Warning: Installation Proxy (port 1080) is currently active.${NC}"
+        read -p "Do you want to remove it before configuring the tunnel? (y/n): " rm_proxy
+        if [[ "$rm_proxy" == "y" ]]; then
+            clear_proxy
+            sleep 1
+        fi
+    fi
+}
+
 installation_proxy() {
     clear
     display_logo
@@ -712,15 +765,11 @@ while true; do
     display_menu
     read -p "Enter your choice: " choice
     case $choice in
-        1) manage_rathole ;;
-        2) manage_sit_gre ;;
-        3) manage_ssh_tunnel ;;
-        4) system_optimizations ;;
-        5) installation_proxy ;;
-        6) cleanup_all ;;
-        7) check_status ;;
-        8) restart_all ;;
-        9) update_script ;;
+        1) manage_tunnels ;;
+        2) manage_services ;;
+        3) installation_proxy ;;
+        4) cleanup_all ;;
+        5) update_script ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
     esac
