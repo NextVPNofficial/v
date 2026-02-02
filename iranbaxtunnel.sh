@@ -598,7 +598,7 @@ parse_vmess_link() {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}} else null end)
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $sni}, "host": $sni} else null end)
             }
         } | del(..|nulls)'
 }
@@ -658,7 +658,7 @@ parse_vless_link() {
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end)
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}, "host": $ws_host} else null end)
             }
         } | del(..|nulls)'
 }
@@ -685,18 +685,35 @@ setup_xray_relay() {
              echo -e "${YELLOW}Converting flat JSON to standard Xray outbound...${NC}"
              outbound=$(echo "$outbound" | jq '
                 if .protocol == "vless" or .protocol == "vmess" then
+                    # Standardize Settings
+                    (.settings.address // .settings.vnext[0].address) as $addr |
+                    (.settings.port // .settings.vnext[0].port) as $port |
+                    ((.settings.id // .settings.users[0].id // .settings.vnext[0].users[0].id) | tostring) as $id |
+                    (.settings.encryption // .settings.users[0].encryption // .settings.vnext[0].users[0].encryption // "none") as $enc |
+                    (.settings.flow // .settings.users[0].flow // .settings.vnext[0].users[0].flow // "") as $flow |
+                    (.settings.security // .settings.users[0].security // .settings.vnext[0].users[0].security // "auto") as $sec |
+
                     .settings = {
                         "vnext": [{
-                            "address": (.settings.address | tostring),
-                            "port": (.settings.port | tonumber),
+                            "address": ($addr | tostring),
+                            "port": ($port | tonumber),
                             "users": [{
-                                "id": ((.settings.id // .settings.users[0].id) | tostring),
-                                "encryption": ((.settings.encryption // "none") | tostring),
-                                "flow": ((.settings.flow // "") | tostring),
-                                "security": ((.settings.security // "auto") | tostring)
+                                "id": $id,
+                                "encryption": (if .protocol == "vless" then $enc else null end),
+                                "security": (if .protocol == "vmess" then $sec else null end),
+                                "flow": (if $flow != "" then $flow else null end)
                             }]
                         }]
-                    }
+                    } |
+                    # Standardize StreamSettings (Safe navigation with ?)
+                    if .streamSettings then
+                        if .streamSettings.wsSettings?.host and (.streamSettings.wsSettings.headers?.Host | not) then
+                            .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
+                        else . end |
+                        if .streamSettings.tlsSettings? and (.streamSettings.tlsSettings.serverName | not) and .streamSettings.wsSettings?.headers?.Host then
+                            .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
+                        else . end
+                    else . end
                 else . end
              ')
         fi
@@ -747,9 +764,10 @@ activate_relay() {
     local in_proto_choice=1
     if [[ "$proto" != "freedom" ]]; then
         echo -e "\nChoose Entry Protocol for Iran Server:"
-        echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels)"
+        echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels/CDN)"
         echo -e "2. SOCKS5 + HTTP Proxy"
-        echo -e "3. ${proto^^} Relay (UUID validation enabled)"
+        echo -e "3. ${proto^^} Relay (Best for simple Client-to-Iran setup)"
+        echo -e "${CYAN}Tip: Use Choice 1 if you want to use the SAME config in V2RayNG (WS/TLS/CDN).${NC}"
         read_num "Choice (default: 1): " "in_proto_choice" 1 3
     else
         echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
@@ -799,10 +817,26 @@ activate_relay() {
             ;;
     esac
 
+    local actual_outbound="$outbound"
+    # Bridge Mode Optimization: If Choice 1 is selected and it's a VLESS/VMESS config,
+    # use freedom redirect to avoid double encapsulation and allow complex protocols to pass-through.
+    if [[ "$in_proto_choice" == "1" && ("$proto" == "vless" || "$proto" == "vmess") ]]; then
+        local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // empty')
+        if [[ -n "$remote_addr" && "$remote_port" != "0" ]]; then
+            actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson port "$remote_port" '{
+                "protocol": "freedom",
+                "settings": { "redirect": ($addr + ":" + ($port|tostring)) },
+                "tag": "outbound-relay"
+            }')
+            echo -e "${YELLOW}Bridge Mode Optimization: Using raw forwarding to $remote_addr:$remote_port${NC}"
+            echo -e "${BLUE}(This prevents double-encryption and works best with CDN/TLS configs)${NC}"
+        fi
+    fi
+
     # Safe JSON assembly using jq
     jq -n \
         --argjson inb "$inbound_json" \
-        --argjson outb "$outbound" \
+        --argjson outb "$actual_outbound" \
         '{
           "log": { "loglevel": "warning" },
           "inbounds": [$inb],
