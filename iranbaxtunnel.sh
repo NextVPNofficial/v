@@ -19,10 +19,17 @@ fi
 
 # Configuration directories
 CONFIG_DIR="/root/iranbaxtunnel"
-RATHOLE_CORE_DIR="${CONFIG_DIR}/rathole-core"
 XRAY_CORE_DIR="${CONFIG_DIR}/xray-core"
 SAVED_PROXIES_FILE="${CONFIG_DIR}/saved_proxies.txt"
 SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
+
+# Service names for cleanup/reference
+XRAY_SERVICE="iranbax-xray.service"
+XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
+SHADOWTLS_SERVICE="iranbax-shadowtls.service"
+SHADOWTLS_BACKEND_SERVICE="iranbax-shadowtls-backend.service"
+ICMP_SERVICE="iranbax-icmp.service"
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 mkdir -p "$CONFIG_DIR" "$SAVED_RELAYS_DIR"
 fi
@@ -196,80 +203,7 @@ get_tunnel_status() {
     local status_line=""
     local active_found=false
 
-    # 1. Rathole
-    if [[ -f "/etc/systemd/system/rathole-iran.service" ]]; then
-        local check="${RED}STOPPED${NC}"
-        if systemctl is-active --quiet "rathole-iran.service"; then
-            local tunnel_port=$(grep "bind_addr" "$IRAN_RATHOLE_CONFIG" | head -n1 | awk -F':' '{print $NF}' | tr -d '"')
-            check="${GREEN}LISTENING:${tunnel_port}${NC}"
-        fi
-        status_line+="${YELLOW}[RH-Server: ${check}]${NC} "
-        active_found=true
-    fi
-    for config in ${CONFIG_DIR}/rathole_client_s[0-9]*.toml; do
-        if [[ -f "$config" ]]; then
-            local idx=$(basename "$config" | grep -oE '[0-9]+')
-            local svc="rathole-kharej-s${idx}.service"
-            local remote=$(grep "remote_addr" "$config" | awk -F'"' '{print $2}')
-            local remote_ip=$(echo "$remote" | awk -F':' '{print $1}')
-            local check="${RED}OFFLINE${NC}"
-            if systemctl is-active --quiet "$svc"; then
-                if ping -c 1 -W 1 "$remote_ip" &>/dev/null; then check="${GREEN}ONLINE${NC}"; else check="${YELLOW}CONNECTING${NC}"; fi
-            fi
-            status_line+="${CYAN}[RH: ${remote} (${check})]${NC} "
-            active_found=true
-        fi
-    done
-
-    # 2. SIT/GRE
-    if ip link show "$TUNNEL_6TO4" &>/dev/null; then
-        local remote=$(ip -o tunnel show "$TUNNEL_6TO4" | grep -oP 'remote \K[^ ]+')
-        local check="${RED}OFFLINE${NC}"
-        if ping -c 1 -W 1 "172.16.0.1" &>/dev/null || ping -c 1 -W 1 "172.16.0.2" &>/dev/null; then
-            check="${GREEN}ONLINE${NC}"
-        elif [[ -n "$remote" ]] && ping -c 1 -W 1 "$remote" &>/dev/null; then
-            check="${YELLOW}HOST-ONLY${NC}"
-        fi
-        status_line+="${BLUE}[SIT/GRE: -> ${remote:-Unknown} (${check})]${NC} "
-        active_found=true
-    fi
-
-    # 3. SSH Tunnels
-    for svc_file in /etc/systemd/system/ssh-tunnel-*.service; do
-        if [[ -f "$svc_file" ]]; then
-            local svc=$(basename "$svc_file")
-            local iran_port=$(echo "$svc" | grep -oE '[0-9]+')
-            local remote=$(grep -oP '@\K[^ ]+' "$svc_file" | head -n1)
-            local check="${RED}STOPPED${NC}"
-            if systemctl is-active --quiet "$svc"; then
-                if check_port_in_use "$iran_port" && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
-                    check="${GREEN}WORKS:${iran_port}${NC}"
-                elif check_port_in_use "$iran_port"; then
-                    check="${YELLOW}LISTENING${NC}"
-                else
-                    check="${YELLOW}FAILED/AUTH${NC}"
-                fi
-            fi
-            status_line+="${MAGENTA}[SSH: -> ${remote} (${check})]${NC} "
-            active_found=true
-        fi
-    done
-
-    # 4. Xray-Reality
-    if [[ -f "/etc/systemd/system/${XRAY_SERVICE}" ]]; then
-        local check="${RED}STOPPED${NC}"
-        if systemctl is-active --quiet "$XRAY_SERVICE"; then
-            check="${GREEN}ONLINE${NC}"
-            local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_CONFIG" | head -n1)
-            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
-                check="${GREEN}WORKS:${iran_port}${NC}"
-            fi
-        fi
-        status_line+="${MAGENTA}[Reality: ${check}]${NC} "
-        active_found=true
-    fi
-
-    # 5. Xray-Relay
+    # 1. Xray-Relay (Priority)
     if [[ -f "/etc/systemd/system/${XRAY_RELAY_SERVICE}" ]]; then
         local check="${RED}STOPPED${NC}"
         local relay_name=$(grep -oP 'Description=Xray Relay Tunnel \(\K[^\)]+' "/etc/systemd/system/${XRAY_RELAY_SERVICE}")
@@ -284,28 +218,22 @@ get_tunnel_status() {
         active_found=true
     fi
 
-    # 5. ShadowTLS
-    if [[ -f "/etc/systemd/system/${SHADOWTLS_SERVICE}" ]]; then
+    # 2. Xray-Reality
+    if [[ -f "/etc/systemd/system/${XRAY_SERVICE}" ]]; then
         local check="${RED}STOPPED${NC}"
-        if systemctl is-active --quiet "$SHADOWTLS_SERVICE"; then
+        if systemctl is-active --quiet "$XRAY_SERVICE"; then
             check="${GREEN}ONLINE${NC}"
+            local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_CONFIG" | head -n1)
+            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+                check="${GREEN}WORKS:${iran_port}${NC}"
+            fi
         fi
-        status_line+="${CYAN}[ShadowTLS: ${check}]${NC} "
-        active_found=true
-    fi
-
-    # 6. ICMP
-    if [[ -f "/etc/systemd/system/${ICMP_SERVICE}" ]]; then
-        local check="${RED}STOPPED${NC}"
-        if systemctl is-active --quiet "$ICMP_SERVICE"; then
-            check="${GREEN}ONLINE${NC}"
-        fi
-        status_line+="${BLUE}[ICMP: ${check}]${NC} "
+        status_line+="${MAGENTA}[Reality: ${check}]${NC} "
         active_found=true
     fi
 
     if [[ "$active_found" == "false" ]]; then
-        status_line="${WHITE}No active tunnels configured.${NC}"
+        status_line="${WHITE}No active Xray tunnels configured.${NC}"
     fi
 
     echo -e "$status_line"
@@ -343,9 +271,8 @@ ____________ _/  |_|  |__   ____ |  |   ____
             \/          \/                 \/
 EOF
     echo -e "${NC}${GREEN}"
-    echo -e "${YELLOW}IRANBAX Tunneling System${GREEN}"
-    echo -e "Version: ${YELLOW}v2.1.0${GREEN}"
-    echo -e "Features: Xray-Relay, Reality, ShadowTLS, Rathole, SIT/GRE, SSH${NC}"
+    echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
+    echo -e "Version: ${YELLOW}v2.2.0 (Xray Focused)${NC}"
 }
 
 # Function to display main menu
@@ -354,45 +281,15 @@ display_menu() {
     display_topbar
     display_logo
     echo ''
-    echo -e "${CYAN}1. Tunneling Management (Rathole, SIT/GRE, SSH, Status)${NC}"
-    echo -e "${YELLOW}2. Service & System Management (Optimizations, Restarts)${NC}"
-    echo -e "${GREEN}3. Installation Proxy (SSH Reverse for Setup)${NC}"
-    echo -e "${RED}4. Remove All Tunnels & Cleanup${NC}"
-    echo -e "5. Update Script"
+    echo -e "${CYAN}1. Xray Relay Management (V2ray Config/Link)${NC}"
+    echo -e "${MAGENTA}2. Xray-Reality Management (Stealth TCP)${NC}"
+    echo -e "${YELLOW}3. Service & System Management (Optimizations, Restarts)${NC}"
+    echo -e "${GREEN}4. Installation Proxy (SSH Reverse for Setup)${NC}"
+    echo -e "${RED}5. Remove All Tunnels & Cleanup${NC}"
+    echo -e "6. Update Script"
     echo -e "0. Exit"
     echo ''
     echo "-------------------------------"
-}
-
-manage_tunnels() {
-    while true; do
-        clear
-        display_logo
-        echo -e "${CYAN}--- Tunneling Management ---${NC}"
-        echo -e "1. Rathole Tunnel"
-        echo -e "2. SIT/GRE (Tunnel Wizard)"
-        echo -e "3. SSH Traffic Tunnel"
-        echo -e "4. Xray-Reality Tunnel (Stealth TCP)"
-        echo -e "5. Xray Relay (Import V2ray Config)"
-        echo -e "6. ShadowTLS v3 Tunnel (Stealth TCP)"
-        echo -e "7. ICMP Tunnel (Ping-based)"
-        echo -e "8. Check All Tunnel Status"
-        echo -e "9. Back"
-        echo ''
-        read_num "Choose an option: " "t_choice" 1 9
-        case $t_choice in
-            1) manage_rathole ;;
-            2) manage_sit_gre ;;
-            3) manage_ssh_tunnel ;;
-            4) manage_xray_reality ;;
-            5) manage_xray_relay ;;
-            6) manage_shadowtls ;;
-            7) manage_icmp_tunnel ;;
-            8) check_status ;;
-            9) break ;;
-            *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
-        esac
-    done
 }
 
 manage_services() {
@@ -414,13 +311,6 @@ manage_services() {
     done
 }
 
-# --- Rathole Logic ---
-
-# Global Variables for Rathole
-RATHOLE_BIN="${RATHOLE_CORE_DIR}/rathole"
-IRAN_RATHOLE_CONFIG="${CONFIG_DIR}/rathole_server.toml"
-IRAN_RATHOLE_SERVICE="rathole-iran.service"
-
 # Function to check if a given string is a valid IPv6 address
 check_ipv6() {
     local ip=$1
@@ -428,259 +318,6 @@ check_ipv6() {
     ip="${ip#[}"
     ip="${ip%]}"
     if [[ $ip =~ $ipv6_pattern ]]; then return 0; else return 1; fi
-}
-
-download_rathole() {
-    local custom_url=$1
-    mkdir -p "$RATHOLE_CORE_DIR"
-    ARCH=$(uname -m)
-    # Map ARCH to rathole naming
-    case "$ARCH" in
-        x86_64) R_ARCH="x86_64" ;;
-        aarch64) R_ARCH="aarch64" ;;
-        *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
-    esac
-
-    local download_url="$custom_url"
-    if [[ -z "$download_url" ]]; then
-        # Add github entry to /etc/hosts to help with DNS issues in Iran
-        ENTRY="185.199.108.133 raw.githubusercontent.com"
-        if ! grep -q "$ENTRY" /etc/hosts; then
-            echo "$ENTRY" >> /etc/hosts
-        fi
-
-        echo -e "${CYAN}Fetching latest Rathole version from GitHub...${NC}"
-        download_url=$(curl -sSL --max-time 10 https://api.github.com/repos/rathole-org/rathole/releases/latest | grep -oP "https://github.com/rathole-org/rathole/releases/download/[v\d.]+/rathole-$R_ARCH-unknown-linux-(gnu|musl)\.zip" | head -n 1)
-
-        if [ -z "$download_url" ]; then
-            echo -e "${RED}Failed to fetch tag. Try Option 3 (Proxy) or provide a Custom URL.${NC}"
-            return 1
-        fi
-    fi
-
-    echo -e "Downloading Rathole from $download_url..."
-    local download_dir=$(mktemp -d)
-    if curl -L --progress-bar -o "$download_dir/rathole.zip" "$download_url"; then
-        unzip -q "$download_dir/rathole.zip" -d "$RATHOLE_CORE_DIR"
-        chmod +x "$RATHOLE_BIN"
-        rm -rf "$download_dir"
-        echo -e "${GREEN}Rathole installed successfully.${NC}"
-    else
-        echo -e "${RED}Failed to download Rathole.${NC}"
-        rm -rf "$download_dir"
-        return 1
-    fi
-}
-
-install_rathole_menu() {
-    clear
-    display_logo
-    echo -e "${CYAN}--- Rathole Installation ---${NC}"
-    echo -e "1. Download Latest from GitHub"
-    echo -e "2. Download from Custom URL"
-    echo -e "3. Install from Local File (${CONFIG_DIR}/rathole.zip)"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose method: " "r_inst_choice" 1 4
-    case $r_inst_choice in
-        1) download_rathole ;;
-        2)
-           read -p "Enter Custom URL: " curl
-           download_rathole "$curl"
-           ;;
-        3)
-           local lzip="${CONFIG_DIR}/rathole.zip"
-           if [[ -f "$lzip" ]]; then
-               mkdir -p "$RATHOLE_CORE_DIR"
-               unzip -q "$lzip" -d "$RATHOLE_CORE_DIR"
-               chmod +x "$RATHOLE_BIN"
-               echo -e "${GREEN}Installed from local zip.${NC}"; sleep 1
-           else
-               echo -e "${RED}File $lzip not found!${NC}"; sleep 2
-           fi
-           ;;
-    esac
-}
-
-manage_rathole() {
-    clear
-    display_logo
-    echo -e "${CYAN}--- Rathole Tunnel Management ---${NC}"
-    echo -e "1. Install Rathole core"
-    echo -e "2. Configure IRAN Server (Server Role)"
-    echo -e "3. Configure KHAREJ Server (Client Role)"
-    echo -e "4. Change Security Token"
-    echo -e "5. Back"
-    echo ''
-    read_num "Choose an option: " "r_choice" 1 5
-
-    case $r_choice in
-        1) install_rathole_menu ;;
-        2) rathole_iran_config ;;
-        3) rathole_kharej_config ;;
-        4) rathole_change_token ;;
-        *) return ;;
-    esac
-}
-
-rathole_iran_config() {
-    check_install_proxy
-    if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
-    clear
-    echo -e "${YELLOW}Configuring IRAN server for Rathole...${NC}"
-    read_port "Enter the tunnel port (the port Rathole listens on): " "tunnel_port" "true"
-    read_num "Enter number of services/ports to tunnel: " "num_ports" 1 100
-
-    ports=()
-    for ((i=1; i<=$num_ports; i++)); do
-        read_port "Enter Service Port $i: " "p" "true"
-        ports+=("$p")
-    done
-
-    read -p "Use IPv6? (y/n): " use_ipv6
-    local_ip="0.0.0.0"
-    [[ "$use_ipv6" == "y" ]] && local_ip="[::]"
-
-    cat << EOF > "$IRAN_RATHOLE_CONFIG"
-[server]
-bind_addr = "${local_ip}:${tunnel_port}"
-default_token = "iranbax_tunnel"
-heartbeat_interval = 20
-
-[server.transport]
-type = "tcp"
-[server.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-EOF
-
-    for p in "${ports[@]}"; do
-        cat << EOF >> "$IRAN_RATHOLE_CONFIG"
-[server.services.${p}]
-type = "tcp"
-bind_addr = "${local_ip}:${p}"
-EOF
-    done
-
-    # Service File
-    cat << EOF > "/etc/systemd/system/${IRAN_RATHOLE_SERVICE}"
-[Unit]
-Description=Rathole Server (Iran)
-After=network.target
-StartLimitIntervalSec=0
-StartLimitBurst=0
-
-[Service]
-Type=simple
-ExecStart=${RATHOLE_BIN} ${IRAN_RATHOLE_CONFIG}
-Restart=always
-RestartSec=5s
-LimitNOFILE=1048576
-LimitNPROC=infinity
-TasksMax=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "$IRAN_RATHOLE_SERVICE"
-    systemctl restart "$IRAN_RATHOLE_SERVICE"
-    echo -e "${GREEN}Rathole IRAN server started!${NC}"
-    sleep 2
-}
-
-rathole_kharej_config() {
-    check_install_proxy
-    if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
-    clear
-    echo -e "${CYAN}Configuring KHAREJ server for Rathole...${NC}"
-    read_num "How many IRAN servers to connect to? " "server_num" 1 100
-
-    # Cleanup old services
-    for svc in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service'); do
-        systemctl stop "$svc" >/dev/null 2>&1
-        systemctl disable "$svc" >/dev/null 2>&1
-        rm -f "/etc/systemd/system/$svc"
-    done
-
-    for ((j=1; j<=$server_num; j++)); do
-        echo -e "${YELLOW}Server $j:${NC}"
-        read_ip "  Enter IRAN Server IP: " "iran_ip"
-        read_port "  Enter IRAN Tunnel Port: " "tunnel_port" "false"
-        read_num "  Enter number of services: " "num_ports" 1 100
-
-        ports=()
-        for ((i=1; i<=$num_ports; i++)); do
-            # Local ports on Kharej don't necessarily need to be checked for usage in the same way, but it's good practice
-            read_port "    Enter Local Port $i: " "p" "true"
-            ports+=("$p")
-        done
-
-        local_ip="0.0.0.0"
-        check_ipv6 "$iran_ip" && local_ip="[::]"
-
-        config_file="${CONFIG_DIR}/rathole_client_s${j}.toml"
-        cat << EOF > "$config_file"
-[client]
-remote_addr = "${iran_ip}:${tunnel_port}"
-default_token = "iranbax_tunnel"
-heartbeat_timeout = 40
-retry_interval = 5
-
-[client.transport]
-type = "tcp"
-[client.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-EOF
-
-        for p in "${ports[@]}"; do
-            cat << EOF >> "$config_file"
-[client.services.${p}]
-type = "tcp"
-local_addr = "${local_ip}:${p}"
-EOF
-        done
-
-        service_name="rathole-kharej-s${j}.service"
-        cat << EOF > "/etc/systemd/system/${service_name}"
-[Unit]
-Description=Rathole Client (Kharej) - Tunnel ${j}
-After=network.target
-StartLimitIntervalSec=0
-StartLimitBurst=0
-
-[Service]
-Type=simple
-ExecStart=${RATHOLE_BIN} ${config_file}
-Restart=always
-RestartSec=5s
-LimitNOFILE=1048576
-LimitNPROC=infinity
-TasksMax=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    done
-
-    systemctl daemon-reload
-    for ((j=1; j<=$server_num; j++)); do
-        systemctl enable "rathole-kharej-s${j}.service"
-        systemctl restart "rathole-kharej-s${j}.service"
-    done
-    echo -e "${GREEN}Rathole KHAREJ tunnels started!${NC}"
-    sleep 2
-}
-
-rathole_change_token() {
-    read -p "Enter new Security Token: " new_token
-    [[ -z "$new_token" ]] && return
-    sed -i "s/default_token = \".*\"/default_token = \"$new_token\"/g" ${CONFIG_DIR}/rathole_*.toml
-    echo -e "${YELLOW}Token updated in config files. Restarting services...${NC}"
-    restart_all
 }
 
 # --- Xray-Reality Logic ---
@@ -737,8 +374,8 @@ install_xray_menu() {
     case $x_inst_choice in
         1) download_xray ;;
         2)
-           read -p "Enter Custom URL: " curl
-           download_xray "$curl"
+           read -p "Enter Custom URL: " x_url
+           download_xray "$x_url"
            ;;
         3)
            local lzip="${CONFIG_DIR}/xray.zip"
@@ -849,6 +486,7 @@ parse_vless_link() {
     # Extract common params
     local security=$(echo "$params" | grep -o 'security=[^&]*' | cut -d'=' -f2)
     local sni=$(echo "$params" | grep -o 'sni=[^&]*' | cut -d'=' -f2)
+    [[ -z "$sni" ]] && sni=$(echo "$params" | grep -o 'peer=[^&]*' | cut -d'=' -f2)
     local type=$(echo "$params" | grep -o 'type=[^&]*' | cut -d'=' -f2)
     local path=$(echo "$params" | grep -o 'path=[^&]*' | cut -d'=' -f2 | sed 's/%2F/\//g')
     local flow=$(echo "$params" | grep -o 'flow=[^&]*' | cut -d'=' -f2)
@@ -880,8 +518,9 @@ parse_vless_link() {
 setup_xray_relay() {
     if [[ ! -f "$XRAY_BIN" ]]; then echo -e "${RED}Install Xray-core first!${NC}"; sleep 1; return; fi
 
-    echo -e "${YELLOW}Paste your Xray Outbound JSON or VLESS Link:${NC}"
-    echo -e "Press Ctrl+D when finished."
+    echo -e "${YELLOW}Paste your Xray Outbound JSON or VLESS/VMESS Link:${NC}"
+    echo -e "Press Ctrl+D followed by Enter when finished."
+    echo -e "${BLUE}(Pro Tip: If pasting large text, ensure it ends with a newline before Ctrl+D)${NC}"
 
     local input=$(cat)
     if [[ -z "$input" ]]; then echo -e "${RED}No input received.${NC}"; sleep 1; return; fi
@@ -893,8 +532,32 @@ setup_xray_relay() {
         outbound=$(parse_vmess_link "$input")
     elif echo "$input" | jq . >/dev/null 2>&1; then
         outbound="$input"
+        # Fix flat JSON format (address directly in settings)
+        if echo "$outbound" | jq -e '.settings.address' >/dev/null 2>&1; then
+             echo -e "${YELLOW}Converting flat JSON to standard Xray outbound...${NC}"
+             local addr=$(echo "$outbound" | jq -r '.settings.address')
+             local port=$(echo "$outbound" | jq -r '.settings.port')
+             local id=$(echo "$outbound" | jq -r '.settings.id')
+             local flow=$(echo "$outbound" | jq -r '.settings.flow')
+             local proto=$(echo "$outbound" | jq -r '.protocol')
+
+             outbound=$(jq -n \
+                --arg addr "$addr" \
+                --argjson port "$port" \
+                --arg id "$id" \
+                --arg flow "$flow" \
+                --arg proto "$proto" \
+                --argjson ss "$(echo "$outbound" | jq '.streamSettings')" \
+                '{
+                    "protocol": $proto,
+                    "settings": {
+                        "vnext": [{"address": $addr, "port": $port, "users": [{"id": $id, "encryption": "none", "flow": $flow}]}]
+                    },
+                    "streamSettings": $ss
+                }')
+        fi
     else
-        echo -e "${RED}Error: Invalid format. Only JSON or vless:// links are supported currently.${NC}"
+        echo -e "${RED}Error: Invalid format. Paste JSON or vless/vmess link.${NC}"
         sleep 2
         return
     fi
@@ -958,14 +621,28 @@ EOF
     systemctl daemon-reload
     systemctl enable "$XRAY_RELAY_SERVICE"
     systemctl restart "$XRAY_RELAY_SERVICE"
-    echo -e "${GREEN}Xray Relay ($name) started on port $iran_port!${NC}"
+
+    echo -e "${CYAN}Checking service status...${NC}"
     sleep 2
+    if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
+        echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
+        # End-to-end check
+        if curl --connect-timeout 2 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+             echo -e "${GREEN}[✔] End-to-end connectivity verified!${NC}"
+        else
+             echo -e "${YELLOW}[!] Service is running but local fetch failed. Check your Kharej configuration.${NC}"
+        fi
+    else
+        echo -e "${RED}[✘] Failed to start Xray Relay service.${NC}"
+        echo -e "${YELLOW}Check logs with: journalctl -u $XRAY_RELAY_SERVICE -n 50${NC}"
+    fi
+    sleep 3
 }
 
 saved_relays_menu() {
     while true; do
-        local files=(${SAVED_RELAYS_DIR}/*.json)
-        if [[ ! -e "${files[0]}" ]]; then
+        local count=$(ls -1 "${SAVED_RELAYS_DIR}"/*.json 2>/dev/null | wc -l)
+        if [[ $count -eq 0 ]]; then
             echo -e "${RED}No saved relays found.${NC}"
             sleep 1
             return
@@ -976,7 +653,7 @@ saved_relays_menu() {
         echo -e "${CYAN}--- Saved Xray Relays ---${NC}"
         local i=1
         local names=()
-        for f in "${files[@]}"; do
+        for f in "${SAVED_RELAYS_DIR}"/*.json; do
             local name=$(basename "$f" .json)
             echo "$i. $name"
             names+=("$name")
@@ -1194,389 +871,6 @@ EOF
     sleep 2
 }
 
-# --- ShadowTLS Logic ---
-
-SHADOWTLS_BIN="${CONFIG_DIR}/shadow-tls"
-SHADOWTLS_SERVICE="iranbax-shadowtls.service"
-SHADOWTLS_BACKEND_SERVICE="iranbax-shadowtls-backend.service"
-
-download_shadowtls() {
-    local custom_url=$1
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) S_ARCH="x86_64-unknown-linux-musl" ;;
-        aarch64) S_ARCH="aarch64-unknown-linux-musl" ;;
-        *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; return 1 ;;
-    esac
-
-    local download_url="$custom_url"
-    if [[ -z "$download_url" ]]; then
-        echo -e "${CYAN}Fetching latest ShadowTLS version from GitHub...${NC}"
-        download_url=$(curl -sSL --max-time 10 https://api.github.com/repos/ihciah/shadow-tls/releases/latest | grep -oP "https://github.com/ihciah/shadow-tls/releases/download/[v\d.]+/shadow-tls-$S_ARCH" | head -n 1)
-
-        if [ -z "$download_url" ]; then
-            echo -e "${RED}Failed to fetch tag. Try Option 3 (Proxy) or provide a Custom URL.${NC}"
-            return 1
-        fi
-    fi
-
-    echo -e "Downloading ShadowTLS from $download_url..."
-    if curl -L --progress-bar -o "$SHADOWTLS_BIN" "$download_url"; then
-        chmod +x "$SHADOWTLS_BIN"
-        echo -e "${GREEN}ShadowTLS installed successfully.${NC}"
-    else
-        echo -e "${RED}Failed to download ShadowTLS.${NC}"
-        return 1
-    fi
-}
-
-install_shadowtls_menu() {
-    clear
-    display_logo
-    echo -e "${CYAN}--- ShadowTLS Installation ---${NC}"
-    echo -e "1. Download Latest from GitHub"
-    echo -e "2. Download from Custom URL"
-    echo -e "3. Install from Local File (${CONFIG_DIR}/shadow-tls)"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose method: " "s_inst_choice" 1 4
-    case $s_inst_choice in
-        1) download_shadowtls ;;
-        2)
-           read -p "Enter Custom URL: " curl
-           download_shadowtls "$curl"
-           ;;
-        3)
-           local lbin="${CONFIG_DIR}/shadow-tls"
-           if [[ -f "$lbin" ]]; then
-               chmod +x "$lbin"
-               echo -e "${GREEN}Installed from local binary.${NC}"; sleep 1
-           else
-               echo -e "${RED}File $lbin not found!${NC}"; sleep 2
-           fi
-           ;;
-    esac
-}
-
-manage_shadowtls() {
-    clear
-    display_logo
-    echo -e "${MAGENTA}--- ShadowTLS v3 Management (Stealth TCP Wrapper) ---${NC}"
-    echo -e "1. Install ShadowTLS binary"
-    echo -e "2. Configure IRAN (Client Role)"
-    echo -e "3. Configure KHAREJ (Server Role)"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose an option: " "s_choice" 1 4
-    case $s_choice in
-        1) install_shadowtls_menu ;;
-        2) setup_shadowtls "client" ;;
-        3) setup_shadowtls "server" ;;
-        *) return ;;
-    esac
-}
-
-setup_shadowtls() {
-    local role=$1
-    if [[ ! -f "$SHADOWTLS_BIN" ]]; then echo -e "${RED}Install ShadowTLS first!${NC}"; sleep 1; return; fi
-    # Ensure Xray is also there for backend
-    download_xray > /dev/null
-
-    local password=$(openssl rand -base64 16)
-    local shadowtls_password=$(openssl rand -base64 16)
-
-    if [[ "$role" == "server" ]]; then
-        echo -e "${YELLOW}Configuring KHAREJ as ShadowTLS Server...${NC}"
-        read_port "Enter the port for ShadowTLS to listen on (e.g., 443): " "server_port" "true" 443
-        read_port "Enter the local backend port (Shadowsocks): " "backend_port" "true" 10001
-        read_port "Enter the final destination port (v2ray on Kharej): " "dest_port" "false" 80
-
-        # 1. Backend (Xray Shadowsocks)
-        cat << EOF > "${CONFIG_DIR}/shadowtls_backend.json"
-{
-  "inbounds": [{
-    "port": $backend_port,
-    "protocol": "shadowsocks",
-    "settings": { "method": "aes-256-gcm", "password": "$password" }
-  }],
-  "outbounds": [{
-    "protocol": "dokodemo-door",
-    "settings": { "address": "127.0.0.1", "port": $dest_port }
-  }]
-}
-EOF
-        cat << EOF > "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
-[Unit]
-Description=ShadowTLS Backend (SS)
-After=network.target
-[Service]
-ExecStart=${XRAY_BIN} -c ${CONFIG_DIR}/shadowtls_backend.json
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        # 2. Wrapper (ShadowTLS)
-        cat << EOF > "/etc/systemd/system/${SHADOWTLS_SERVICE}"
-[Unit]
-Description=ShadowTLS Wrapper (Server)
-After=network.target
-[Service]
-ExecStart=${SHADOWTLS_BIN} --fastopen --v3 server --listen 0.0.0.0:$server_port --server 127.0.0.1:$backend_port --tls www.google.com:443 --password $shadowtls_password
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        systemctl enable "$SHADOWTLS_BACKEND_SERVICE" "$SHADOWTLS_SERVICE"
-        systemctl restart "$SHADOWTLS_BACKEND_SERVICE" "$SHADOWTLS_SERVICE"
-
-        echo -e "${GREEN}ShadowTLS Server Started!${NC}"
-        echo -e "${YELLOW}--- Credentials for IRAN server ---${NC}"
-        echo -e "${WHITE}SS Password: $password${NC}"
-        echo -e "${WHITE}ShadowTLS Password: $shadowtls_password${NC}"
-        echo -e "${YELLOW}----------------------------------${NC}"
-    else
-        echo -e "${CYAN}Configuring IRAN as ShadowTLS Client...${NC}"
-        read_ip "Enter KHAREJ IP: " "kharej_ip"
-        read_port "Enter KHAREJ ShadowTLS Port: " "kharej_port" "false" 443
-        read_port "Enter IRAN Local Port: " "iran_port" "true" 80
-        read_port "Enter Local Intermediate Port: " "inter_port" "true" 10002
-        read -p "Enter SS Password from Kharej: " password
-        read -p "Enter ShadowTLS Password from Kharej: " shadowtls_password
-
-        # 1. Wrapper (ShadowTLS Client)
-        cat << EOF > "/etc/systemd/system/${SHADOWTLS_SERVICE}"
-[Unit]
-Description=ShadowTLS Wrapper (Client)
-After=network.target
-[Service]
-ExecStart=${SHADOWTLS_BIN} --fastopen --v3 client --listen 127.0.0.1:$inter_port --server $kharej_ip:$kharej_port --tls www.google.com:443 --password $shadowtls_password
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        # 2. Backend Client (Xray SS Client)
-        cat << EOF > "${CONFIG_DIR}/shadowtls_client.json"
-{
-  "inbounds": [{
-    "port": $iran_port,
-    "protocol": "dokodemo-door",
-    "settings": { "address": "127.0.0.1", "port": $inter_port }
-  }],
-  "outbounds": [{
-    "protocol": "shadowsocks",
-    "settings": {
-      "servers": [{ "address": "127.0.0.1", "port": $inter_port, "method": "aes-256-gcm", "password": "$password" }]
-    }
-  }]
-}
-EOF
-        cat << EOF > "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
-[Unit]
-Description=ShadowTLS Backend Client (SS)
-After=network.target
-[Service]
-ExecStart=${XRAY_BIN} -c ${CONFIG_DIR}/shadowtls_client.json
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        systemctl enable "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE"
-        systemctl restart "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE"
-        echo -e "${GREEN}ShadowTLS Client Started on port $iran_port!${NC}"
-    fi
-    sleep 2
-}
-
-# --- ICMP Logic ---
-
-ICMP_SERVICE="iranbax-icmp.service"
-
-manage_icmp_tunnel() {
-    clear
-    display_logo
-    echo -e "${BLUE}--- ICMP Tunnel Management (ptunnel-ng) ---${NC}"
-    echo -e "1. Install ptunnel-ng"
-    echo -e "2. Configure IRAN (Client Role)"
-    echo -e "3. Configure KHAREJ (Server Role)"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose an option: " "i_choice" 1 4
-    case $i_choice in
-        1)
-            echo -e "${CYAN}Installing ptunnel-ng...${NC}"
-            sudo apt-get install -y ptunnel-ng || {
-                echo -e "${YELLOW}Build from source or check repo...${NC}"
-                # Simplified for this script
-            }
-            sleep 1
-            ;;
-        2) setup_icmp_tunnel "client" ;;
-        3) setup_icmp_tunnel "server" ;;
-        *) return ;;
-    esac
-}
-
-setup_icmp_tunnel() {
-    local role=$1
-    if ! command -v ptunnel-ng &>/dev/null; then echo -e "${RED}Install ptunnel-ng first!${NC}"; sleep 1; return; fi
-
-    if [[ "$role" == "server" ]]; then
-        echo -e "${YELLOW}Configuring KHAREJ as ICMP Server...${NC}"
-        cat << EOF > "/etc/systemd/system/${ICMP_SERVICE}"
-[Unit]
-Description=ICMP Tunnel (Server)
-After=network.target
-[Service]
-ExecStart=/usr/sbin/ptunnel-ng -r
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable "$ICMP_SERVICE"
-        systemctl restart "$ICMP_SERVICE"
-        echo -e "${GREEN}ICMP Server Started!${NC}"
-    else
-        echo -e "${CYAN}Configuring IRAN as ICMP Client...${NC}"
-        read_ip "Enter KHAREJ IP: " "kharej_ip"
-        read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
-        read_port "Enter KHAREJ Dest Port (v2ray port): " "dest_port" "false" 80
-
-        cat << EOF > "/etc/systemd/system/${ICMP_SERVICE}"
-[Unit]
-Description=ICMP Tunnel (Client)
-After=network.target
-[Service]
-ExecStart=/usr/sbin/ptunnel-ng -p $kharej_ip -l $iran_port -r 127.0.0.1 -R $dest_port
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable "$ICMP_SERVICE"
-        systemctl restart "$ICMP_SERVICE"
-        echo -e "${GREEN}ICMP Client Started on port $iran_port!${NC}"
-    fi
-    sleep 2
-}
-
-# --- SIT/GRE Logic ---
-
-# Constants for SIT/GRE
-TUNNEL_6TO4="tun6to4"
-TUNNEL_GRE="gre1"
-TABLE_ID=4
-
-detect_interface() {
-    local interface=$(ip route | grep default | awk '{print $5}' | head -n1)
-    [[ -z "$interface" ]] && interface=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1)
-    echo "$interface"
-}
-
-manage_sit_gre() {
-    clear
-    display_logo
-    local main_iface=$(detect_interface)
-    echo -e "${BLUE}--- SIT/GRE Tunnel Management (Tunnel Wizard) ---${NC}"
-    echo -e "Main Interface: ${YELLOW}$main_iface${NC}"
-    echo ''
-    echo -e "1. Setup IRAN Server (Relay)"
-    echo -e "2. Setup KHAREJ Server (Endpoint)"
-    echo -e "3. Remove SIT/GRE Tunnel"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose an option: " "s_choice" 1 4
-
-    case $s_choice in
-        1) setup_sit_gre "iran" "$main_iface" ;;
-        2) setup_sit_gre "kharej" "$main_iface" ;;
-        3) remove_sit_gre ;;
-        *) return ;;
-    esac
-}
-
-setup_sit_gre() {
-    check_install_proxy
-    local role=$1
-    local main_iface=$2
-
-    read_ip "Enter Remote Server Public IP: " "remote_ip"
-    read -p "Enter IPv6 Prefix (default: fd01::): " prefix
-    prefix=${prefix:-"fd01::"}
-
-    # Modules
-    modprobe sit
-    modprobe ip6_gre
-
-    # Cleanup old
-    ip tunnel del "$TUNNEL_GRE" 2>/dev/null
-    ip tunnel del "$TUNNEL_6TO4" 2>/dev/null
-
-    if [[ "$role" == "iran" ]]; then
-        local_v6="${prefix}2"
-        remote_v6="${prefix}1"
-        local_v4_tun="172.16.0.2/30"
-        remote_v4_tun="172.16.0.1"
-    else
-        local_v6="${prefix}1"
-        remote_v6="${prefix}2"
-        local_v4_tun="172.16.0.1/30"
-        remote_v4_tun="172.16.0.2"
-    fi
-
-    # SIT
-    ip tunnel add "$TUNNEL_6TO4" mode sit ttl 254 remote "$remote_ip"
-    ip link set dev "$TUNNEL_6TO4" up
-    ip addr add "${local_v6}/64" dev "$TUNNEL_6TO4"
-    ip link set dev "$TUNNEL_6TO4" mtu 1480
-
-    # GRE
-    ip tunnel add "$TUNNEL_GRE" mode ip6gre remote "$remote_v6" local "$local_v6"
-    ip link set "$TUNNEL_GRE" up
-    ip addr add "$local_v4_tun" dev "$TUNNEL_GRE"
-    ip link set dev "$TUNNEL_GRE" mtu 1476
-
-    # Routing & NAT
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null
-
-    # Cleanup old iptables rules
-    iptables -t nat -S | grep "tunnel_wizard" | sed 's/-A/-D/' | while read line; do iptables -t nat $line 2>/dev/null; done
-
-    if [[ "$role" == "iran" ]]; then
-        ip route add default via "$remote_v4_tun" table $TABLE_ID 2>/dev/null || ip route replace default via "$remote_v4_tun" table $TABLE_ID
-        iptables -t nat -A PREROUTING -p tcp --dport 22 -m comment --comment "tunnel_wizard" -j ACCEPT
-        iptables -t nat -A PREROUTING -p tcp --dport 1:65535 -m comment --comment "tunnel_wizard" -j DNAT --to-destination "$remote_v4_tun"
-        iptables -t nat -A PREROUTING -p udp --dport 1:65535 -m comment --comment "tunnel_wizard" -j DNAT --to-destination "$remote_v4_tun"
-        iptables -t nat -A POSTROUTING -m comment --comment "tunnel_wizard" -j MASQUERADE
-    else
-        ip route add default via "$remote_v4_tun" table $TABLE_ID 2>/dev/null || ip route replace default via "$remote_v4_tun" table $TABLE_ID
-        ip rule del from 172.16.0.0/30 table $TABLE_ID 2>/dev/null
-        ip rule add from 172.16.0.0/30 table $TABLE_ID
-        iptables -t nat -A POSTROUTING -s 172.16.0.0/30 -m comment --comment "tunnel_wizard" -j MASQUERADE
-    fi
-
-    echo -e "${GREEN}SIT/GRE Tunnel Established!${NC}"
-    sleep 2
-}
-
-remove_sit_gre() {
-    echo -e "${YELLOW}Removing SIT/GRE Tunnels...${NC}"
-    iptables -t nat -S | grep "tunnel_wizard" | sed 's/-A/-D/' | while read line; do iptables -t nat $line 2>/dev/null; done
-    ip rule del from 172.16.0.0/30 table $TABLE_ID 2>/dev/null
-    ip route flush table $TABLE_ID 2>/dev/null
-    ip tunnel del "$TUNNEL_GRE" 2>/dev/null
-    ip tunnel del "$TUNNEL_6TO4" 2>/dev/null
-    echo -e "${GREEN}Done.${NC}"
-    sleep 1
-}
-# --- SSH Traffic Tunnel Logic ---
-
 setup_ssh_keys() {
     local target_ip=$1
     local ssh_user=$2
@@ -1595,94 +889,6 @@ setup_ssh_keys() {
         echo -e "${RED}Failed to copy SSH key.${NC}"
     fi
 }
-
-manage_ssh_tunnel() {
-    clear
-    display_logo
-    echo -e "${MAGENTA}--- SSH Traffic Tunnel Management ---${NC}"
-    echo -e "1. Setup Local Port Forward (Iran -> Kharej)"
-    echo -e "2. Setup Remote Port Forward (Kharej -> Iran)"
-    echo -e "3. Remove SSH Tunnels"
-    echo -e "4. Back"
-    echo ''
-    read_num "Choose an option: " "s_choice" 1 4
-
-    case $s_choice in
-        1) setup_ssh_traffic "local" ;;
-        2) setup_ssh_traffic "remote" ;;
-        3) remove_ssh_traffic ;;
-        *) return ;;
-    esac
-}
-
-setup_ssh_traffic() {
-    check_install_proxy
-    local type=$1
-    read_ip "Enter Target Server IP: " "target_ip"
-    read -p "Enter SSH Username (default: root): " ssh_user
-    ssh_user=${ssh_user:-root}
-    read_port "Enter SSH Port (default: 22): " "ssh_port" "false" 22
-    read_port "Enter IRAN Port to listen on: " "iran_port" "true"
-    read_port "Enter KHAREJ Port to connect to: " "kharej_port" "false"
-
-    echo ''
-    read -p "Do you want to setup SSH Keys for passwordless access? (Recommended) (y/n): " setup_keys
-    if [[ "$setup_keys" == "y" ]]; then
-        setup_ssh_keys "$target_ip" "$ssh_user" "$ssh_port"
-    fi
-
-    echo -e "${YELLOW}Establishing persistent SSH tunnel via Systemd...${NC}"
-
-    local service_name="ssh-tunnel-${iran_port}.service"
-    local ssh_cmd=""
-
-    local common_opts="-C -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o TCPKeepAlive=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
-    if [[ "$type" == "local" ]]; then
-        # Local: Current server listens on iran_port and forwards to target_ip:kharej_port
-        ssh_cmd="ssh ${common_opts} -L 0.0.0.0:${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
-    else
-        # Remote: Current server connects to target_ip and opens iran_port ON target_ip
-        ssh_cmd="ssh ${common_opts} -R 0.0.0.0:${iran_port}:localhost:${kharej_port} -p ${ssh_port} ${ssh_user}@${target_ip}"
-        echo -e "${YELLOW}Note: Remote forwarding requires 'GatewayPorts yes' in the target server's sshd_config.${NC}"
-    fi
-
-    cat << EOF > "/etc/systemd/system/${service_name}"
-[Unit]
-Description=SSH Tunnel ${type} ${iran_port}->${kharej_port}
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${ssh_cmd}
-Restart=always
-RestartSec=10s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "$service_name"
-    systemctl restart "$service_name"
-
-    echo -e "${GREEN}SSH Tunnel Service ${service_name} created and started!${NC}"
-    sleep 2
-}
-
-remove_ssh_traffic() {
-    echo -e "${YELLOW}Removing SSH Traffic Tunnels...${NC}"
-    for svc in $(systemctl list-units --type=service --all | grep -oE 'ssh-tunnel-[0-9]+\.service'); do
-        systemctl stop "$svc"
-        systemctl disable "$svc"
-        rm -f "/etc/systemd/system/$svc"
-    done
-    systemctl daemon-reload
-    echo -e "${GREEN}Done.${NC}"
-    sleep 1
-}
-# --- System Optimizations Logic ---
 
 system_optimizations() {
     clear
@@ -1895,62 +1101,46 @@ installation_proxy() {
 cleanup_all() {
     echo -e "${RED}--- Destroying All Tunnels & Cleaning Up ---${NC}"
 
-    # 1. Rathole
-    echo -e "${YELLOW}Stopping Rathole services...${NC}"
-    systemctl stop "rathole-*" 2>/dev/null
-    systemctl disable "rathole-*" 2>/dev/null
+    # Stop all services
+    echo -e "${YELLOW}Stopping all tunnel services...${NC}"
+    systemctl stop "rathole-*" "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" "$ICMP_SERVICE" "ssh-tunnel-*" 2>/dev/null
+    systemctl disable "rathole-*" "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" "$ICMP_SERVICE" "ssh-tunnel-*" 2>/dev/null
+
+    # Remove systemd files
     rm -f /etc/systemd/system/rathole-*.service
-
-    # 2. SIT/GRE
-    remove_sit_gre
-
-    # 3. SSH Traffic
-    remove_ssh_traffic
-
-    # 4. Xray/Reality
-    echo -e "${YELLOW}Stopping Xray services...${NC}"
-    systemctl stop "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
-    systemctl disable "$XRAY_SERVICE" "$XRAY_RELAY_SERVICE" 2>/dev/null
+    rm -f /etc/systemd/system/ssh-tunnel-*.service
     rm -f "/etc/systemd/system/${XRAY_SERVICE}" "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
-
-    # 5. ShadowTLS
-    echo -e "${YELLOW}Stopping ShadowTLS services...${NC}"
-    systemctl stop "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" 2>/dev/null
-    systemctl disable "$SHADOWTLS_SERVICE" "$SHADOWTLS_BACKEND_SERVICE" 2>/dev/null
     rm -f "/etc/systemd/system/${SHADOWTLS_SERVICE}" "/etc/systemd/system/${SHADOWTLS_BACKEND_SERVICE}"
-
-    # 6. ICMP
-    echo -e "${YELLOW}Stopping ICMP services...${NC}"
-    systemctl stop "$ICMP_SERVICE" 2>/dev/null
-    systemctl disable "$ICMP_SERVICE" 2>/dev/null
     rm -f "/etc/systemd/system/${ICMP_SERVICE}"
 
-    # 7. Files
-    echo -e "${YELLOW}Removing configuration files...${NC}"
-    rm -rf "$CONFIG_DIR"
+    # SIT/GRE cleanup
+    ip tunnel del "gre1" 2>/dev/null
+    ip tunnel del "tun6to4" 2>/dev/null
+    iptables -t nat -S | grep "tunnel_wizard" | sed 's/-A/-D/' | while read line; do iptables -t nat $line 2>/dev/null; done
+    ip rule del from 172.16.0.0/30 table 4 2>/dev/null
+    ip route flush table 4 2>/dev/null
 
-    # 5. Proxies
+    # Remove ACTIVE config files but NOT the whole directory or zip/relays
+    echo -e "${YELLOW}Removing active configuration files...${NC}"
+    rm -f "${CONFIG_DIR}/xray_config.json" "${CONFIG_DIR}/xray_relay.json"
+    rm -f "${CONFIG_DIR}/rathole_server.toml" "${CONFIG_DIR}/rathole_client_s"*.toml
+    rm -f "${CONFIG_DIR}/shadowtls_backend.json" "${CONFIG_DIR}/shadowtls_client.json"
+
+    # Proxies
     clear_proxy
 
     systemctl daemon-reload
-    echo -e "${GREEN}All tunnels destroyed and files cleaned up!${NC}"
+    echo -e "${GREEN}All active tunnels destroyed! (Folder and saved relays were preserved)${NC}"
     sleep 2
 }
 
 check_status() {
     clear
+    display_topbar
     display_logo
-    echo -e "${CYAN}--- All Tunnels Status ---${NC}"
+    echo -e "${CYAN}--- Xray Tunnel Status ---${NC}"
     echo ''
-    echo -e "${YELLOW}[Rathole]${NC}"
-    systemctl list-units --type=service --all | grep "rathole" || echo "No Rathole services."
-    echo ''
-    echo -e "${BLUE}[SIT/GRE]${NC}"
-    ip link show "$TUNNEL_6TO4" 2>/dev/null && echo -e "${GREEN}SIT OK${NC}" || echo "SIT Offline"
-    ip link show "$TUNNEL_GRE" 2>/dev/null && echo -e "${GREEN}GRE OK${NC}" || echo "GRE Offline"
-    echo ''
-    echo -e "${MAGENTA}[SSH Tunnels]${NC}"
-    systemctl list-units --type=service --all | grep "ssh-tunnel" || echo "No SSH tunnels."
+    systemctl list-units --type=service --all | grep -E "iranbax-xray" || echo "No Xray services configured."
     echo ''
     read -p "Press Enter to continue..."
     flush_stdin
@@ -1993,13 +1183,14 @@ update_script() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 while true; do
     display_menu
-    read_num "Enter your choice: " "choice" 0 5
+    read_num "Enter your choice: " "choice" 0 6
     case $choice in
-        1) manage_tunnels ;;
-        2) manage_services ;;
-        3) installation_proxy ;;
-        4) cleanup_all ;;
-        5) update_script ;;
+        1) manage_xray_relay ;;
+        2) manage_xray_reality ;;
+        3) manage_services ;;
+        4) installation_proxy ;;
+        5) cleanup_all ;;
+        6) update_script ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
     esac
