@@ -10,7 +10,7 @@ MAGENTA="\e[95m"
 NC='\033[0m' # No Color
 
 # Check if the script is run as root
-if [[ $EUID -ne 0 ]]; then
+if [[ $EUID -ne 0 && "${BASH_SOURCE[0]}" == "${0}" ]]; then
    echo -e "${RED}This script must be run as root${NC}"
    sleep 1
    exit 1
@@ -19,7 +19,93 @@ fi
 # Configuration directories
 CONFIG_DIR="/root/iranbaxtunnel"
 RATHOLE_CORE_DIR="${CONFIG_DIR}/rathole-core"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 mkdir -p "$CONFIG_DIR"
+fi
+
+# --- Input Validation Logic ---
+
+# Function to flush stdin
+flush_stdin() {
+    local unused
+    while read -r -t 0.1 unused; do :; done
+}
+
+# Function to validate IP (v4 or v6)
+is_valid_ip() {
+    local ip=$1
+    # IPv4 regex
+    local ipv4_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+    # IPv6 regex
+    local ipv6_regex="^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$"
+
+    if [[ $ip =~ $ipv4_regex || $ip =~ $ipv6_regex ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to validate port
+is_valid_port() {
+    local port=$1
+    if [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Wrapper for read with validation
+read_ip() {
+    local prompt=$1
+    local var_name=$2
+    local input
+    while true; do
+        read -p "$prompt" input
+        if is_valid_ip "$input"; then
+            eval "$var_name=\"$input\""
+            break
+        else
+            echo -e "${RED}Invalid IP address format. Please try again.${NC}"
+            flush_stdin
+        fi
+    done
+}
+
+read_port() {
+    local prompt=$1
+    local var_name=$2
+    local input
+    while true; do
+        read -p "$prompt" input
+        if is_valid_port "$input"; then
+            eval "$var_name=\"$input\""
+            break
+        else
+            echo -e "${RED}Invalid port number (1-65535). Please try again.${NC}"
+            flush_stdin
+        fi
+    done
+}
+
+read_num() {
+    local prompt=$1
+    local var_name=$2
+    local min=$3
+    local max=$4
+    local input
+    while true; do
+        read -p "$prompt" input
+        if [[ $input =~ ^[0-9]+$ ]] && [ "$input" -ge "$min" ] && [ "$input" -le "$max" ]; then
+            eval "$var_name=\"$input\""
+            break
+        else
+            echo -e "${RED}Invalid number. Please enter a value between $min and $max.${NC}"
+            flush_stdin
+        fi
+    done
+}
 
 # Function to check and install dependencies
 ensure_deps() {
@@ -52,7 +138,9 @@ ensure_deps() {
 }
 
 # Run dependency check
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 ensure_deps
+fi
 
 # Function to display ASCII logo
 display_logo() {
@@ -97,7 +185,7 @@ manage_tunnels() {
         echo -e "4. Check All Tunnel Status"
         echo -e "5. Back"
         echo ''
-        read -p "Choose an option: " t_choice
+        read_num "Choose an option: " "t_choice" 1 5
         case $t_choice in
             1) manage_rathole ;;
             2) manage_sit_gre ;;
@@ -118,7 +206,7 @@ manage_services() {
         echo -e "2. Restart All Services"
         echo -e "3. Back"
         echo ''
-        read -p "Choose an option: " s_choice
+        read_num "Choose an option: " "s_choice" 1 3
         case $s_choice in
             1) system_optimizations ;;
             2) restart_all ;;
@@ -190,7 +278,7 @@ manage_rathole() {
     echo -e "4. Change Security Token"
     echo -e "5. Back"
     echo ''
-    read -p "Choose an option: " r_choice
+    read_num "Choose an option: " "r_choice" 1 5
 
     case $r_choice in
         1) download_rathole; sleep 1 ;;
@@ -206,12 +294,12 @@ rathole_iran_config() {
     if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
     clear
     echo -e "${YELLOW}Configuring IRAN server for Rathole...${NC}"
-    read -p "Enter the tunnel port (the port Rathole listens on): " tunnel_port
-    read -p "Enter number of services/ports to tunnel: " num_ports
+    read_port "Enter the tunnel port (the port Rathole listens on): " "tunnel_port"
+    read_num "Enter number of services/ports to tunnel: " "num_ports" 1 100
 
     ports=()
     for ((i=1; i<=$num_ports; i++)); do
-        read -p "Enter Service Port $i: " p
+        read_port "Enter Service Port $i: " "p"
         ports+=("$p")
     done
 
@@ -273,7 +361,7 @@ rathole_kharej_config() {
     if [[ ! -f "$RATHOLE_BIN" ]]; then echo -e "${RED}Install Rathole first!${NC}"; sleep 1; return; fi
     clear
     echo -e "${CYAN}Configuring KHAREJ server for Rathole...${NC}"
-    read -p "How many IRAN servers to connect to? " server_num
+    read_num "How many IRAN servers to connect to? " "server_num" 1 100
 
     # Cleanup old services
     for svc in $(systemctl list-units --type=service --all | grep -oE 'rathole-kharej-s[0-9]+\.service'); do
@@ -284,13 +372,13 @@ rathole_kharej_config() {
 
     for ((j=1; j<=$server_num; j++)); do
         echo -e "${YELLOW}Server $j:${NC}"
-        read -p "  Enter IRAN Server IP: " iran_ip
-        read -p "  Enter IRAN Tunnel Port: " tunnel_port
-        read -p "  Enter number of services: " num_ports
+        read_ip "  Enter IRAN Server IP: " "iran_ip"
+        read_port "  Enter IRAN Tunnel Port: " "tunnel_port"
+        read_num "  Enter number of services: " "num_ports" 1 100
 
         ports=()
         for ((i=1; i<=$num_ports; i++)); do
-            read -p "    Enter Local Port $i: " p
+            read_port "    Enter Local Port $i: " "p"
             ports+=("$p")
         done
 
@@ -385,7 +473,7 @@ manage_sit_gre() {
     echo -e "3. Remove SIT/GRE Tunnel"
     echo -e "4. Back"
     echo ''
-    read -p "Choose an option: " s_choice
+    read_num "Choose an option: " "s_choice" 1 4
 
     case $s_choice in
         1) setup_sit_gre "iran" "$main_iface" ;;
@@ -400,7 +488,7 @@ setup_sit_gre() {
     local role=$1
     local main_iface=$2
 
-    read -p "Enter Remote Server Public IP: " remote_ip
+    read_ip "Enter Remote Server Public IP: " "remote_ip"
     read -p "Enter IPv6 Prefix (default: fd01::): " prefix
     prefix=${prefix:-"fd01::"}
 
@@ -480,7 +568,7 @@ manage_ssh_tunnel() {
     echo -e "3. Remove SSH Tunnels"
     echo -e "4. Back"
     echo ''
-    read -p "Choose an option: " s_choice
+    read_num "Choose an option: " "s_choice" 1 4
 
     case $s_choice in
         1) setup_ssh_traffic "local" ;;
@@ -493,13 +581,13 @@ manage_ssh_tunnel() {
 setup_ssh_traffic() {
     check_install_proxy
     local type=$1
-    read -p "Enter Target Server IP: " target_ip
+    read_ip "Enter Target Server IP: " "target_ip"
     read -p "Enter SSH Username (default: root): " ssh_user
     ssh_user=${ssh_user:-root}
-    read -p "Enter SSH Port (default: 22): " ssh_port
+    read_port "Enter SSH Port (default: 22): " "ssh_port"
     ssh_port=${ssh_port:-22}
-    read -p "Enter IRAN Port to listen on: " iran_port
-    read -p "Enter KHAREJ Port to connect to: " kharej_port
+    read_port "Enter IRAN Port to listen on: " "iran_port"
+    read_port "Enter KHAREJ Port to connect to: " "kharej_port"
 
     echo -e "${YELLOW}Establishing persistent SSH tunnel via Systemd...${NC}"
     echo -e "${CYAN}Note: It's highly recommended to setup SSH Keys for passwordless access.${NC}"
@@ -560,7 +648,7 @@ system_optimizations() {
     echo -e "1. Apply All Optimizations (Ubuntu/Debian)"
     echo -e "2. Back"
     echo ''
-    read -p "Choose an option: " opt_choice
+    read_num "Choose an option: " "opt_choice" 1 2
 
     if [[ "$opt_choice" == "1" ]]; then
         echo -e "${CYAN}Applying optimizations...${NC}"
@@ -637,6 +725,8 @@ check_install_proxy() {
         if [[ "$rm_proxy" == "y" ]]; then
             clear_proxy
             sleep 1
+        else
+            flush_stdin
         fi
     fi
 }
@@ -651,14 +741,14 @@ installation_proxy() {
     echo -e "2. Clear Proxy Settings"
     echo -e "3. Back"
     echo ''
-    read -p "Choose an option: " proxy_choice
+    read_num "Choose an option: " "proxy_choice" 1 3
 
     case $proxy_choice in
         1)
-            read -p "Enter Foreign Server IP: " proxy_ip
+            read_ip "Enter Foreign Server IP: " "proxy_ip"
             read -p "Enter SSH Username (default: root): " proxy_user
             proxy_user=${proxy_user:-root}
-            read -p "Enter SSH Port (default: 22): " proxy_port
+            read_port "Enter SSH Port (default: 22): " "proxy_port"
             proxy_port=${proxy_port:-22}
 
             echo -e "${CYAN}Establishing SSH tunnel... You may be prompted for password.${NC}"
@@ -725,6 +815,7 @@ check_status() {
     systemctl list-units --type=service --all | grep "ssh-tunnel" || echo "No SSH tunnels."
     echo ''
     read -p "Press Enter to continue..."
+    flush_stdin
 }
 
 restart_all() {
@@ -761,9 +852,10 @@ update_script() {
 }
 
 # Main loop
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 while true; do
     display_menu
-    read -p "Enter your choice: " choice
+    read_num "Enter your choice: " "choice" 0 5
     case $choice in
         1) manage_tunnels ;;
         2) manage_services ;;
@@ -774,3 +866,4 @@ while true; do
         *) echo -e "${RED}Invalid option!${NC}" && sleep 1 ;;
     esac
 done
+fi
