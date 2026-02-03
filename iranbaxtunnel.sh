@@ -685,7 +685,6 @@ setup_xray_relay() {
 
     echo -e "${YELLOW}Paste your Xray Outbound JSON or VLESS/VMESS Link:${NC}"
     echo -e "Press Ctrl+D followed by Enter when finished."
-    echo -e "${BLUE}(Pro Tip: If pasting large text, ensure it ends with a newline before Ctrl+D)${NC}"
 
     local input=$(cat)
     if [[ -z "$input" ]]; then echo -e "${RED}No input received.${NC}"; sleep 1; return; fi
@@ -696,66 +695,15 @@ setup_xray_relay() {
     elif [[ "$input" == vmess://* ]]; then
         outbound=$(parse_vmess_link "$input")
     elif echo "$input" | jq . >/dev/null 2>&1; then
-        outbound="$input"
-        # Fix flat JSON format (address directly in settings)
-        if echo "$outbound" | jq -e '.settings.address // .settings.vnext[0].address' >/dev/null 2>&1; then
-             echo -e "${YELLOW}Standardizing Xray outbound JSON...${NC}"
-             outbound=$(echo "$outbound" | jq '
-                if .protocol == "vless" or .protocol == "vmess" then
-                    # Standardize Settings
-                    (.settings.address // .settings.vnext[0].address) as $addr |
-                    (.settings.port // .settings.vnext[0].port) as $port |
-                    ((.settings.id // .settings.users[0].id // .settings.vnext[0].users[0].id) | tostring) as $id |
-                    (.settings.encryption // .settings.users[0].encryption // .settings.vnext[0].users[0].encryption // "none") as $enc |
-                    (.settings.flow // .settings.users[0].flow // .settings.vnext[0].users[0].flow // "") as $flow |
-                    (.settings.security // .settings.users[0].security // .settings.vnext[0].users[0].security // "auto") as $sec |
-
-                    .settings = {
-                        "vnext": [{
-                            "address": ($addr | tostring),
-                            "port": ($port | tonumber),
-                            "users": [{
-                                "id": $id,
-                                "encryption": (if .protocol == "vless" then ($enc // "none") else null end),
-                                "security": (if .protocol == "vmess" then ($sec // "auto") else null end),
-                                "flow": (if $flow != "" then $flow else null end)
-                            }]
-                        }]
-                    } |
-                    # Standardize StreamSettings
-                    if .streamSettings then
-                        # Set security to none if it is empty string
-                        if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
-
-                        # Fix WS headers (jq 1.6 compatible)
-                        if .streamSettings.wsSettings then
-                            .streamSettings.wsSettings |= (
-                                if .host and (.headers.Host == null) then
-                                    .headers = (.headers // {}) | .headers.Host = .host
-                                else . end
-                            )
-                        else . end |
-
-                        # Fix xHTTP headers
-                        if .streamSettings.xhttpSettings then
-                            .streamSettings.xhttpSettings |= (
-                                if .host and (.headers.Host == null) then
-                                    .headers = (.headers // {}) | .headers.Host = .host
-                                else . end
-                            )
-                        else . end |
-
-                        # Fix TLS SNI and ensure advanced fields are kept
-                        if .streamSettings.tlsSettings then
-                            if (.streamSettings.tlsSettings.serverName == null) then
-                                (.streamSettings.wsSettings.headers.Host // .streamSettings.xhttpSettings.headers.Host // .streamSettings.tcpSettings.header.request.headers.Host[0] // ($addr | tostring)) as $sni |
-                                .streamSettings.tlsSettings.serverName = $sni
-                            else . end
-                        else . end
-                    else . end
-                else . end
-             ')
-        fi
+        echo -e "${CYAN}Importing JSON configuration...${NC}"
+        # Non-destructive standardization: extract outbound if nested, ensure tag
+        outbound=$(echo "$input" | jq '
+            if type == "array" then .[0] else . end |
+            if type == "object" then
+                if .outbounds then .outbounds[0] else . end |
+                .tag = "outbound-relay"
+            else . end
+        ')
     else
         echo -e "${RED}Error: Invalid format. Paste JSON or vless/vmess link.${NC}"
         sleep 2
@@ -795,59 +743,38 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
+
+    # Robust extraction of fields (supports flat and vnext)
     local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.address // .settings.redirect // empty' | cut -d: -f1)
     local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.port // .settings.redirect // 0' | awk -F':' '{print $NF}')
-    local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
+    local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // .settings.id // .settings.users[0].id // empty')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    echo -e "\nChoose Entry Protocol for Iran Server:"
-    echo "1. Relay Mode (VLESS/VMess) - Recommended"
-    echo "   Iran server acts as client for Kharej. You use a simple config on your phone."
-    echo "2. SOCKS5 + HTTP Proxy"
-    echo "   Iran server provides a SOCKS/HTTP port. Best for simple apps."
-    echo "3. Bridge Mode (Transparent) - Recommended for Marzban/Panels"
-    echo "   Iran acts as a pipe. You use the EXACT SAME config in your client, just change IP to Iran."
-    read_num "Choice (default: 1): " "t_choice" 1 3
-    t_choice=${t_choice:-1}
-
     local inbound_json=""
     local actual_outbound=""
-    local in_tag="inbound-relay"
+    local mode="Relay"
 
-    if [[ "$t_choice" == "1" ]]; then
-        # RELAY MODE
+    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]]; then
+        # SMART RELAY MODE - Auto UUID Matching
+        mode="Relay"
         if [[ "$proto" == "vless" ]]; then
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vless",
                 "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
                 "tag": "inbound-relay"
             }')
-        elif [[ "$proto" == "vmess" ]]; then
+        else
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vmess",
                 "settings": { "clients": [ { "id": $id } ] },
                 "tag": "inbound-relay"
             }')
-        else
-            # Fallback to bridge if protocol unknown
-            t_choice=3
         fi
         actual_outbound="$outbound"
-    fi
-
-    if [[ "$t_choice" == "2" ]]; then
-        # SOCKS5 + HTTP
-        inbound_json=$(jq -n --argjson p "$iran_port" '{
-            "port": $p, "protocol": "socks",
-            "settings": { "auth": "noauth", "udp": true },
-            "tag": "inbound-relay"
-        }')
-        actual_outbound="$outbound"
-    fi
-
-    if [[ "$t_choice" == "3" ]]; then
-        # BRIDGE MODE - Pure Dokodemo
+    else
+        # SMART BRIDGE MODE - Transparent Pipe
+        mode="Bridge"
         inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
             "port": $p, "protocol": "dokodemo-door",
             "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
@@ -857,52 +784,37 @@ activate_relay() {
         actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
     fi
 
-    # Refactored JSON assembly to match X-UI structure provided by the user
+    # Rock-solid production JSON structure mimicking X-UI
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
-        --arg in_tag "$in_tag" \
         '{
-          "api": {
-            "services": ["HandlerService", "LoggerService", "StatsService"],
-            "tag": "api"
+          "log": { "access": "none", "dnsLog": false, "error": "", "loglevel": "warning", "maskAddress": "" },
+          "api": { "services": ["HandlerService", "LoggerService", "StatsService"], "tag": "api" },
+          "stats": {},
+          "policy": {
+            "levels": { "0": { "statsUserDownlink": true, "statsUserUplink": true } },
+            "system": { "statsInboundDownlink": true, "statsInboundUplink": true }
           },
+          "dns": { "servers": ["1.1.1.1", "8.8.8.8", "localhost"] },
           "inbounds": [
-            {
-              "listen": "127.0.0.1",
-              "port": 62789,
-              "protocol": "dokodemo-door",
-              "settings": { "address": "127.0.0.1" },
-              "tag": "api"
-            },
+            { "listen": "127.0.0.1", "port": 62789, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" },
             $inb
           ],
-          "log": {
-            "access": "none",
-            "dnsLog": false,
-            "error": "",
-            "loglevel": "warning",
-            "maskAddress": ""
-          },
           "outbounds": [
             ($outb | .tag = "outbound-relay"),
             { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
             { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
           ],
-          "policy": {
-            "levels": { "0": { "statsUserDownlink": true, "statsUserUplink": true } },
-            "system": { "statsInboundDownlink": true, "statsInboundUplink": true }
-          },
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
               { "inboundTag": ["api"], "outboundTag": "api", "type": "field" },
               { "ip": ["geoip:private"], "outboundTag": "blocked", "type": "field" },
               { "outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field" },
-              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" }
+              { "inboundTag": ["inbound-relay"], "outboundTag": "outbound-relay", "type": "field" }
             ]
-          },
-          "stats": {}
+          }
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
@@ -940,23 +852,21 @@ EOF
         echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
         if ss -tulnp | grep -q ":$iran_port "; then
              echo -e "${GREEN}[✔] Tunnel is ACTIVE and listening on port $iran_port.${NC}"
-             if [[ "$t_choice" == "1" ]]; then
-                 echo -e "${YELLOW}IMPORTANT (Relay Mode):${NC}"
-                 echo -e "In your client (v2rayNG/N), you MUST set:"
-                 echo -e " - ${CYAN}Security/TLS: None${NC}"
-                 echo -e " - ${CYAN}Transport: TCP (no WS/HTTP/etc)${NC}"
-                 echo -e "Iran server handles the complex Kharej connection for you."
-             elif [[ "$t_choice" == "2" ]]; then
-                 echo -e "${YELLOW}IMPORTANT (SOCKS5/HTTP Mode):${NC}"
-                 echo -e "Connect your browser or app to:"
-                 echo -e " - ${CYAN}Type: SOCKS5 (or HTTP)${NC}"
-                 echo -e " - ${CYAN}Address: [Iran IP]${NC}"
-                 echo -e " - ${CYAN}Port: $iran_port${NC}"
-             elif [[ "$t_choice" == "3" ]]; then
-                 echo -e "${YELLOW}IMPORTANT (Bridge Mode):${NC}"
-                 echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC}, but change:"
-                 echo -e " - ${CYAN}Address: [Iran IP]${NC}"
-                 echo -e " - ${CYAN}Port: $iran_port${NC}"
+             if [[ "$mode" == "Relay" ]]; then
+                 echo -e "${YELLOW}MODE: Smart Protocol Relay${NC}"
+                 echo -e "In your v2rayNG/v2rayN client, create a ${CYAN}SIMPLE CONFIG${NC}:"
+                 echo -e " - Protocol: $proto"
+                 echo -e " - Address: [Iran IP]"
+                 echo -e " - Port: $iran_port"
+                 echo -e " - UUID: $id"
+                 echo -e " - ${MAGENTA}Security/TLS: None${NC}"
+                 echo -e " - ${MAGENTA}Transport: TCP${NC}"
+                 echo -e "Iran server handles the encryption to Kharej for you."
+             else
+                 echo -e "${YELLOW}MODE: Smart Transparent Bridge${NC}"
+                 echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC} on your phone, but change:"
+                 echo -e " - Address: [Iran IP]"
+                 echo -e " - Port: $iran_port"
              fi
         else
              echo -e "${RED}[!] Service is running but port $iran_port is not listening.${NC}"
@@ -1006,7 +916,7 @@ saved_relays_menu() {
         read_num "Choose action: " "a_idx" 1 6
 
         case $a_idx in
-            1) activate_relay "$selected"; return ;;
+            1) activate_relay "$selected" ;;
             2)
                echo -e "${CYAN}Showing last 50 lines of logs for $selected...${NC}"
                journalctl -u "$XRAY_RELAY_SERVICE" -n 50 --no-pager
