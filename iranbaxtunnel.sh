@@ -607,12 +607,11 @@ parse_vmess_link() {
             "streamSettings": {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
-                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["h2", "http/1.1"] end)} else null end),
+                "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true} else null end),
                 "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}} else null end),
                 "grpcSettings": (if $net == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [$sni] end)}}}} else null end)
-            },
-            "mux": {"enabled": false}
+            }
         } | del(..|nulls)'
 }
 
@@ -697,13 +696,12 @@ parse_vless_link() {
             "streamSettings": {
                 "network": $type,
                 "security": $security,
-                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["h2", "http/1.1"] end)} else null end),
-                "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "publicKey": $pbk, "shortId": $sid, "spiderX": "/"} else null end),
+                "tlsSettings": (if $security == "tls" then {"serverName": $sni, "allowInsecure": $allow_ins} else null end),
+                "realitySettings": (if $security == "reality" then {"serverName": $sni, "publicKey": $pbk, "shortId": $sid} else null end),
                 "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}} else null end),
                 "grpcSettings": (if $type == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [$sni] end)}}}} else null end)
-            },
-            "mux": {"enabled": false}
+            }
         } | del(..|nulls)'
 }
 
@@ -842,14 +840,12 @@ activate_relay() {
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vless",
                 "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
                 "tag": "inbound-relay"
             }')
         else
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vmess",
                 "settings": { "clients": [ { "id": $id } ] },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
                 "tag": "inbound-relay"
             }')
         fi
@@ -866,42 +862,16 @@ activate_relay() {
         actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
     fi
 
-    # Robust standard JSON structure for maximum compatibility
+    # Extreme minimal JSON structure for maximum compatibility
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
         '{
-          "log": { "loglevel": "warning" },
-          "dns": { "servers": ["1.1.1.1", "8.8.8.8"] },
           "inbounds": [$inb],
           "outbounds": [
-            ($outb | .tag = "outbound-relay"),
-            { "protocol": "freedom", "tag": "direct" },
-            { "protocol": "blackhole", "tag": "blocked" }
-          ],
-          "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-              { "type": "field", "inboundTag": ["inbound-relay"], "outboundTag": "outbound-relay" }
-            ]
-          }
+            ($outb | .tag = "outbound-relay")
+          ]
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
-
-    # Validate configuration
-    if [[ -f "$XRAY_BIN" ]]; then
-        # Try different test commands for different Xray versions
-        if ! "$XRAY_BIN" -t -c "$XRAY_RELAY_CONFIG" > /tmp/xray_test.log 2>&1 && \
-           ! "$XRAY_BIN" run -t -c "$XRAY_RELAY_CONFIG" >> /tmp/xray_test.log 2>&1; then
-            echo -e "${RED}Xray configuration validation failed!${NC}"
-            cat /tmp/xray_test.log
-            echo -e "${YELLOW}The generated JSON might be incompatible with your Xray version.${NC}"
-            sleep 3
-            # We continue anyway if test command is unknown, as it might just be the test command failing
-            if ! grep -q "unknown command" /tmp/xray_test.log; then
-                return
-            fi
-        fi
-    fi
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
