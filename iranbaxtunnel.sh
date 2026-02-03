@@ -296,7 +296,7 @@ display_logo() {
 EOF
     echo -e "${NC}${GREEN}"
     echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
-    echo -e "Version: ${YELLOW}v3.5.0 (Simplified Unified Tunnel)${NC}"
+    echo -e "Version: ${YELLOW}v3.5.6 (CDN Bridge Optimized)${NC}"
 }
 
 # Function to display main menu
@@ -698,8 +698,8 @@ setup_xray_relay() {
     elif echo "$input" | jq . >/dev/null 2>&1; then
         outbound="$input"
         # Fix flat JSON format (address directly in settings)
-        if echo "$outbound" | jq -e '.settings.address' >/dev/null 2>&1; then
-             echo -e "${YELLOW}Converting flat JSON to standard Xray outbound...${NC}"
+        if echo "$outbound" | jq -e '.settings.address // .settings.vnext[0].address' >/dev/null 2>&1; then
+             echo -e "${YELLOW}Standardizing Xray outbound JSON...${NC}"
              outbound=$(echo "$outbound" | jq '
                 if .protocol == "vless" or .protocol == "vmess" then
                     # Standardize Settings
@@ -727,21 +727,21 @@ setup_xray_relay() {
                         # Set security to none if it is empty string
                         if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
 
-                        # Fix WS headers
+                        # Fix WS headers while preserving existing fields
                         if .streamSettings.wsSettings then
                             if .streamSettings.wsSettings.host and (.streamSettings.wsSettings.headers?.Host | not) then
                                 .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
                             else . end
                         else . end |
 
-                        # Fix xHTTP headers
+                        # Fix xHTTP headers while preserving existing fields
                         if .streamSettings.xhttpSettings then
                             if .streamSettings.xhttpSettings.host and (.streamSettings.xhttpSettings.headers?.Host | not) then
                                 .streamSettings.xhttpSettings.headers.Host = .streamSettings.xhttpSettings.host
                             else . end
                         else . end |
 
-                        # Fix TLS SNI
+                        # Fix TLS SNI and ensure advanced fields are kept
                         if .streamSettings.tlsSettings then
                             if (.streamSettings.tlsSettings.serverName | not) then
                                 if .streamSettings.wsSettings?.headers?.Host then
@@ -836,14 +836,22 @@ activate_relay() {
     fi
 
     if [[ "$t_choice" == "2" ]]; then
-        # BRIDGE MODE
-        inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+        # BRIDGE MODE - Unified Transparent Pipe
+        inbound_json=$(jq -n --argjson p "$iran_port" '{
             "port": $p, "protocol": "dokodemo-door",
-            "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
-            "sniffing": { "enabled": true },
+            "settings": { "network": "tcp,udp", "followRedirect": true },
+            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
             "tag": "inbound-bridge"
         }')
-        actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
+        # We use freedom redirect to force the destination, which bypasses any sniffing override issues
+        actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+            "protocol": "freedom",
+            "settings": {
+                "redirect": ($addr + ":" + ($rp|tostring)),
+                "domainStrategy": "UseIP"
+            },
+            "tag": "outbound-relay"
+        }')
         in_tag="inbound-bridge"
     fi
 
@@ -901,10 +909,20 @@ EOF
     sleep 2
     if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
         echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
-        # Simple check: is the port listening?
         if ss -tulnp | grep -q ":$iran_port "; then
              echo -e "${GREEN}[✔] Tunnel is ACTIVE and listening on port $iran_port.${NC}"
-             echo -e "${CYAN}Tip: Just change the IP and Port in your V2RayNG/v2rayN client to this server.${NC}"
+             if [[ "$t_choice" == "1" ]]; then
+                 echo -e "${YELLOW}IMPORTANT (Relay Mode):${NC}"
+                 echo -e "In your client (v2rayNG/N), you MUST set:"
+                 echo -e " - ${CYAN}Security/TLS: None${NC}"
+                 echo -e " - ${CYAN}Transport: TCP (no WS/HTTP/etc)${NC}"
+                 echo -e "Iran server handles the complex Kharej connection for you."
+             else
+                 echo -e "${YELLOW}IMPORTANT (Bridge Mode):${NC}"
+                 echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC}, but change:"
+                 echo -e " - ${CYAN}Address: [Iran IP]${NC}"
+                 echo -e " - ${CYAN}Port: $iran_port${NC}"
+             fi
         else
              echo -e "${RED}[!] Service is running but port $iran_port is not listening.${NC}"
              echo -e "${YELLOW}Check logs with: journalctl -u $XRAY_RELAY_SERVICE -n 50${NC}"
