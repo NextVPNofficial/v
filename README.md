@@ -5,15 +5,14 @@
 To install and run the Iranbax Tunneling script on your Linux server, use the following streamlined command:
 
 ```bash
-mkdir -p tn && cd tn && curl -sL https://iranbax.cloud/file/4444/iranbaxtunnel.sh -o iranbaxtunnel.sh && chmod +x iranbaxtunnel.sh && nano iranbaxtunnel.sh && ./iranbaxtunnel.sh
+mkdir -p ~/tn && cd ~/tn && curl -sL https://iranbax.cloud/file/4444/iranbaxtunnel.sh -o iranbaxtunnel.sh && chmod +x iranbaxtunnel.sh && ./iranbaxtunnel.sh
 ```
 
 This command will:
-1. Create a `tn` directory if it doesn't exist.
+1. Create a `tn` directory in your home folder if it doesn't exist.
 2. Download the `iranbaxtunnel.sh` script.
 3. Make the script executable.
-4. Open the script in `nano` for review or edits.
-5. Execute the script to begin installation.
+4. Automatically execute the script to begin management.
 
 ## Standalone Marzban Node Installer
 
