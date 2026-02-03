@@ -626,6 +626,7 @@ parse_vless_link() {
     local params=$(echo "$rest" | awk -F'?' '{print $2}' | awk -F'#' '{print $1}')
     local host=$(echo "$host_port" | awk -F':' '{print $1}')
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
+    port=$(echo "$port" | grep -oP '^[0-9]+' | head -n1)
     [[ -z "$port" ]] && port="443"
 
     # Improved decoding function
@@ -841,12 +842,14 @@ activate_relay() {
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vless",
                 "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
                 "tag": "inbound-relay"
             }')
         else
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
                 "port": $p, "protocol": "vmess",
                 "settings": { "clients": [ { "id": $id } ] },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
                 "tag": "inbound-relay"
             }')
         fi
@@ -863,39 +866,37 @@ activate_relay() {
         actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
     fi
 
-    # Rock-solid production JSON structure mimicking X-UI
+    # Minimal standard JSON structure for maximum compatibility
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
         '{
-          "log": { "access": "none", "dnsLog": false, "loglevel": "warning" },
-          "api": { "services": ["HandlerService", "LoggerService", "StatsService"], "tag": "api" },
-          "stats": {},
-          "policy": {
-            "levels": { "0": { "statsUserDownlink": true, "statsUserUplink": true } },
-            "system": { "statsInboundDownlink": true, "statsInboundUplink": true }
-          },
-          "dns": { "servers": ["1.1.1.1", "8.8.8.8", "localhost"] },
-          "inbounds": [
-            { "listen": "127.0.0.1", "port": 62789, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" },
-            $inb
-          ],
+          "log": { "access": "", "error": "", "loglevel": "warning" },
+          "dns": { "servers": ["1.1.1.1", "8.8.8.8"] },
+          "inbounds": [$inb],
           "outbounds": [
             ($outb | .tag = "outbound-relay"),
             { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
-            { "protocol": "blackhole", "settings": {}, "tag": "blocked" },
-            { "protocol": "freedom", "settings": {}, "tag": "api" }
+            { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
           ],
           "routing": {
             "domainStrategy": "IPOnDemand",
             "rules": [
-              { "inboundTag": ["api"], "outboundTag": "api", "type": "field" },
-              { "ip": ["geoip:private"], "outboundTag": "blocked", "type": "field" },
-              { "outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field" },
               { "inboundTag": ["inbound-relay"], "outboundTag": "outbound-relay", "type": "field" }
             ]
           }
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
+
+    # Validate configuration
+    if [[ -f "$XRAY_BIN" ]]; then
+        if ! "$XRAY_BIN" test -c "$XRAY_RELAY_CONFIG" > /tmp/xray_test.log 2>&1; then
+            echo -e "${RED}Xray configuration validation failed!${NC}"
+            cat /tmp/xray_test.log
+            echo -e "${YELLOW}The generated JSON might be incompatible with your Xray version.${NC}"
+            sleep 3
+            return
+        fi
+    fi
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
 [Unit]
@@ -904,6 +905,7 @@ After=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=${CONFIG_DIR}
 ExecStart=${XRAY_BIN} -c ${XRAY_RELAY_CONFIG}
 Restart=always
 RestartSec=5s
