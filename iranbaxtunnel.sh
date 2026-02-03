@@ -780,25 +780,35 @@ activate_relay() {
 
     local outbound=$(cat "$config_file")
     local proto=$(echo "$outbound" | jq -r '.protocol')
-    local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.redirect // 0' | awk -F':' '{print $NF}')
+    local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.address // .settings.redirect // empty' | cut -d: -f1)
+    local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.port // .settings.redirect // 0' | awk -F':' '{print $NF}')
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
+    local is_tls=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.redirect // empty' | cut -d: -f1)
+    if [[ "$iran_port" == "80" && ("$is_tls" == "tls" || "$is_tls" == "reality") ]]; then
+        echo -e "${YELLOW}Warning: Using port 80 for TLS/Reality traffic might be blocked in Iran.${NC}"
+        echo -e "${YELLOW}If it doesn't work, try using port 443 or another port.${NC}"
+        sleep 2
+    fi
 
     # Unified Relay Mode: Use Dokodemo-door Inbound + Freedom Redirect Outbound
     # This is the most robust way to relay complex configs (TLS, WS, CDN).
-    local inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+    local inbound_json=$(jq -n --argjson p "$iran_port" '{
         "port": $p,
         "protocol": "dokodemo-door",
-        "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
+        "settings": { "network": "tcp,udp", "followRedirect": false },
+        "sniffing": { "enabled": true, "metadataOnly": false },
         "tag": "inbound-unified"
     }')
 
     local actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson rp "$remote_port" '{
         "protocol": "freedom",
-        "settings": { "redirect": ($addr + ":" + ($rp|tostring)) },
+        "settings": {
+            "redirect": ($addr + ":" + ($rp|tostring)),
+            "domainStrategy": "AsIs"
+        },
         "tag": "outbound-relay"
     }')
 
