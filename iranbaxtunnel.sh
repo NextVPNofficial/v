@@ -27,7 +27,13 @@ SAVED_RELAYS_DIR="${CONFIG_DIR}/relays"
 XRAY_SERVICE="iranbax-xray.service"
 XRAY_RELAY_SERVICE="iranbax-xray-relay.service"
 
-XRAY_BIN="${XRAY_CORE_DIR}/xray"
+if [[ -f "${XRAY_CORE_DIR}/xray" ]]; then
+    XRAY_BIN="${XRAY_CORE_DIR}/xray"
+elif command -v xray >/dev/null 2>&1; then
+    XRAY_BIN=$(command -v xray)
+else
+    XRAY_BIN="${XRAY_CORE_DIR}/xray"
+fi
 XRAY_CONFIG="${CONFIG_DIR}/xray_config.json"
 XRAY_RELAY_CONFIG="${CONFIG_DIR}/xray_relay.json"
 
@@ -373,7 +379,8 @@ download_xray() {
     local download_dir=$(mktemp -d)
     if curl -L --progress-bar -o "$download_dir/xray.zip" "$download_url"; then
         unzip -q "$download_dir/xray.zip" -d "$XRAY_CORE_DIR"
-        chmod +x "$XRAY_BIN"
+        chmod +x "${XRAY_CORE_DIR}/xray"
+        XRAY_BIN="${XRAY_CORE_DIR}/xray"
         rm -rf "$download_dir"
         echo -e "${GREEN}Xray-core installed successfully.${NC}"
     else
@@ -404,7 +411,8 @@ install_xray_menu() {
            if [[ -f "$lzip" ]]; then
                mkdir -p "$XRAY_CORE_DIR"
                unzip -q "$lzip" -d "$XRAY_CORE_DIR"
-               chmod +x "$XRAY_BIN"
+               chmod +x "${XRAY_CORE_DIR}/xray"
+               XRAY_BIN="${XRAY_CORE_DIR}/xray"
                echo -e "${GREEN}Installed from local zip.${NC}"; sleep 1
            else
                echo -e "${RED}File $lzip not found!${NC}"; sleep 2
@@ -814,7 +822,7 @@ activate_relay() {
     # Detect if config is simple enough for Relay Mode
     local security=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
 
-    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]] && [[ "$security" == "none" ]]; then
+    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]]; then
         # SMART RELAY MODE - Iran handles obfuscation (TCP, WS, HTTP Headers)
         mode="Relay"
         if [[ "$proto" == "vless" ]]; then
