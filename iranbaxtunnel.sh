@@ -786,38 +786,59 @@ activate_relay() {
     local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.address // .settings.redirect // empty' | cut -d: -f1)
     local remote_port=$(echo "$outbound" | jq -r '.settings.vnext[0].port // .settings.port // .settings.redirect // 0' | awk -F':' '{print $NF}')
     local id=$(echo "$outbound" | jq -r '.settings.vnext[0].users[0].id // empty')
-    local is_tls=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    if [[ "$iran_port" == "80" && ("$is_tls" == "tls" || "$is_tls" == "reality") ]]; then
-        echo -e "${RED}⚠️  IMPORTANT WARNING: Port 80 is strictly for HTTP in many Iran Datacenters.${NC}"
-        echo -e "${YELLOW}Your config uses TLS/Reality. If you use Port 80, your connection will likely be DROPPED.${NC}"
-        echo -e "${YELLOW}RECOMMENDATION: Use Port 443, 8080, 8443 or any other port instead.${NC}"
-        read -p "Do you still want to use port 80? (y/n, default: n): " confirm_80
-        [[ "$confirm_80" != "y" ]] && { flush_stdin; activate_relay "$name"; return; }
+    echo -e "\nChoose Tunnel Type:"
+    echo "1. Relay Mode (Act as Client) - Recommended for simple setup"
+    echo "   Iran server handles TLS/WS. You connect to Iran with a simple VLESS/VMESS config."
+    echo "2. Bridge Mode (Pass-through) - Recommended for Marzban/Panels"
+    echo "   Iran acts as a pipe. You use the EXACT SAME config in your client, just change IP to Iran."
+    read_num "Choice (default: 1): " "t_choice" 1 2
+    t_choice=${t_choice:-1}
+
+    local inbound_json=""
+    local actual_outbound=""
+    local in_tag="inbound-relay"
+
+    if [[ "$t_choice" == "1" ]]; then
+        # RELAY MODE
+        if [[ "$proto" == "vless" ]]; then
+            inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
+                "port": $p, "protocol": "vless",
+                "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
+                "tag": "inbound-relay"
+            }')
+        elif [[ "$proto" == "vmess" ]]; then
+            inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
+                "port": $p, "protocol": "vmess",
+                "settings": { "clients": [ { "id": $id } ] },
+                "tag": "inbound-relay"
+            }')
+        else
+            # Fallback for plain freedom or other types
+            t_choice=2
+        fi
+        actual_outbound="$outbound"
     fi
 
-    # Unified Relay Mode: Use Dokodemo-door Inbound + Freedom Outbound
-    # This is the most robust way to relay complex configs (TLS, WS, CDN).
-    local inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
-        "port": $p,
-        "protocol": "dokodemo-door",
-        "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
-        "sniffing": { "enabled": true },
-        "tag": "inbound-unified"
-    }')
-
-    local actual_outbound=$(jq -n '{
-        "protocol": "freedom",
-        "settings": { "domainStrategy": "UseIP" },
-        "tag": "outbound-relay"
-    }')
+    if [[ "$t_choice" == "2" ]]; then
+        # BRIDGE MODE
+        inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+            "port": $p, "protocol": "dokodemo-door",
+            "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
+            "sniffing": { "enabled": true },
+            "tag": "inbound-bridge"
+        }')
+        actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
+        in_tag="inbound-bridge"
+    fi
 
     # Safe JSON assembly using jq
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
+        --arg in_tag "$in_tag" \
         '{
           "log": { "loglevel": "warning" },
           "inbounds": [$inb],
@@ -825,7 +846,7 @@ activate_relay() {
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
-              { "type": "field", "inboundTag": ["inbound-unified"], "outboundTag": "outbound-relay" }
+              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" }
             ]
           }
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
