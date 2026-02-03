@@ -296,7 +296,7 @@ display_logo() {
 EOF
     echo -e "${NC}${GREEN}"
     echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
-    echo -e "Version: ${YELLOW}v3.0.0 (Xray Focused)${NC}"
+    echo -e "Version: ${YELLOW}v3.5.0 (Simplified Unified Tunnel)${NC}"
 }
 
 # Function to display main menu
@@ -785,78 +785,23 @@ activate_relay() {
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    local in_proto_choice=1
-    if [[ "$proto" != "freedom" ]]; then
-        echo -e "\nChoose Entry Protocol for Iran Server:"
-        echo -e "1. Bridge Mode (Transparent, best for Marzban/Panels/CDN)"
-        echo -e "2. SOCKS5 + HTTP Proxy"
-        echo -e "3. ${proto^^} Relay (Best for simple Client-to-Iran setup)"
-        echo -e "${CYAN}Note: Choice 1 is HIGHLY recommended for configurations using TLS, WebSocket, or CDN.${NC}"
-        echo -e "${CYAN}With Choice 1, you can use your original config in V2RayNG by just changing the IP/Port to Iran.${NC}"
-        read_num "Choice (default: 1): " "in_proto_choice" 1 3
-    else
-        echo -e "\nProtocol is Plain TCP. Defaulting to Bridge Mode."
-        in_proto_choice=1
-    fi
-    in_proto_choice=${in_proto_choice:-1}
+    local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // .settings.redirect // empty' | cut -d: -f1)
 
-    local inbound_json=""
-    case $in_proto_choice in
-        1)
-            # Bridge Mode: Dokodemo-door
-            inbound_json=$(jq -n --argjson p "$iran_port" --argjson rp "$remote_port" '{
-                "port": $p,
-                "protocol": "dokodemo-door",
-                "settings": { "address": "127.0.0.1", "port": $rp, "network": "tcp,udp" },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
-                "tag": "inbound-bridge"
-            }')
-            ;;
-        2)
-            # SOCKS Mode
-            inbound_json=$(jq -n --argjson p "$iran_port" '{
-                "port": $p,
-                "protocol": "socks",
-                "settings": { "auth": "noauth", "udp": true },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
-                "tag": "inbound-socks"
-            }')
-            ;;
-        3)
-            # Protocol specific
-            if [[ "$proto" == "vless" ]]; then
-                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
-                    "port": $p,
-                    "protocol": "vless",
-                    "settings": { "clients": [ { "id": $id } ], "decryption": "none" },
-                    "tag": "inbound-vless"
-                }')
-            elif [[ "$proto" == "vmess" ]]; then
-                inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
-                    "port": $p,
-                    "protocol": "vmess",
-                    "settings": { "clients": [ { "id": $id } ] },
-                    "tag": "inbound-vmess"
-                }')
-            fi
-            ;;
-    esac
+    # Unified Relay Mode: Use Dokodemo-door Inbound + Freedom Redirect Outbound
+    # This is the most robust way to relay complex configs (TLS, WS, CDN).
+    local inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+        "port": $p,
+        "protocol": "dokodemo-door",
+        "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
+        "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
+        "tag": "inbound-unified"
+    }')
 
-    local actual_outbound="$outbound"
-    # Bridge Mode Optimization: If Choice 1 is selected and it's a VLESS/VMESS config,
-    # use freedom redirect to avoid double encapsulation and allow complex protocols to pass-through.
-    if [[ "$in_proto_choice" == "1" && ("$proto" == "vless" || "$proto" == "vmess") ]]; then
-        local remote_addr=$(echo "$outbound" | jq -r '.settings.vnext[0].address // empty')
-        if [[ -n "$remote_addr" && "$remote_port" != "0" ]]; then
-            actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson port "$remote_port" '{
-                "protocol": "freedom",
-                "settings": { "redirect": ($addr + ":" + ($port|tostring)) },
-                "tag": "outbound-relay"
-            }')
-            echo -e "${YELLOW}Bridge Mode Optimization: Using raw forwarding to $remote_addr:$remote_port${NC}"
-            echo -e "${BLUE}(This prevents double-encryption and works best with CDN/TLS configs)${NC}"
-        fi
-    fi
+    local actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson port "$remote_port" '{
+        "protocol": "freedom",
+        "settings": { "redirect": ($addr + ":" + ($port|tostring)) },
+        "tag": "outbound-relay"
+    }')
 
     # Safe JSON assembly using jq
     jq -n \
@@ -869,7 +814,7 @@ activate_relay() {
           "routing": {
             "domainStrategy": "AsIs",
             "rules": [
-              { "type": "field", "inboundTag": ["inbound-bridge", "inbound-socks", "inbound-vless", "inbound-vmess"], "outboundTag": "outbound-relay" }
+              { "type": "field", "inboundTag": ["inbound-unified"], "outboundTag": "outbound-relay" }
             ]
           }
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
@@ -907,31 +852,13 @@ EOF
     sleep 2
     if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
         echo -e "${GREEN}Xray Relay ($name) is now ACTIVE on port $iran_port!${NC}"
-        # End-to-end check
-        echo -e "${CYAN}Performing end-to-end connectivity test...${NC}"
-        local test_cmd="curl -L --connect-timeout 5 -s -o /dev/null -w \"%{http_code}\""
-        local fetch_ok=false
-
-        if [[ "$in_proto_choice" == "1" ]]; then
-            # Test via SOCKS5
-            if [[ $($test_cmd --proxy socks5h://127.0.0.1:$iran_port http://www.google.com/generate_204) == "204" ]]; then
-                fetch_ok=true
-            fi
+        # Simple check: is the port listening?
+        if ss -tulnp | grep -q ":$iran_port "; then
+             echo -e "${GREEN}[✔] Tunnel is ACTIVE and listening on port $iran_port.${NC}"
+             echo -e "${CYAN}Tip: Just change the IP and Port in your V2RayNG/v2rayN client to this server.${NC}"
         else
-            # For VLESS/VMESS, we can't easily test with curl without a client,
-            # so we check if the port is at least listening and responding
-            if ss -tulnp | grep -q ":$iran_port "; then
-                echo -e "${YELLOW}[!] Protocol-specific relay is listening. Connect your V2ray client to verify.${NC}"
-                sleep 2
-                return
-            fi
-        fi
-
-        if [[ "$fetch_ok" == "true" ]]; then
-             echo -e "${GREEN}[✔] End-to-end connectivity verified! Proxy is working.${NC}"
-        else
-             echo -e "${RED}[!] Service is running but internet fetch failed.${NC}"
-             echo -e "${YELLOW}Possible reasons: Kharej server down, wrong UUID/Port, or blocked.${NC}"
+             echo -e "${RED}[!] Service is running but port $iran_port is not listening.${NC}"
+             echo -e "${YELLOW}Check logs with: journalctl -u $XRAY_RELAY_SERVICE -n 50${NC}"
         fi
     else
         echo -e "${RED}[✘] Failed to start Xray Relay service.${NC}"
