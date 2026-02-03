@@ -296,7 +296,7 @@ display_logo() {
 EOF
     echo -e "${NC}${GREEN}"
     echo -e "${YELLOW}IRANBAX TUNNELING SYSTEM${GREEN}"
-    echo -e "Version: ${YELLOW}v3.5.6 (CDN Bridge Optimized)${NC}"
+    echo -e "Version: ${YELLOW}v3.5.7 (Smart Relay Optimized)${NC}"
 }
 
 # Function to display main menu
@@ -741,8 +741,12 @@ setup_xray_relay() {
                     else . end |
                     if .streamSettings.tcpSettings then
                         .streamSettings.tcpSettings |= (
-                            if .header.type == "http" and .header.request.headers.Host == null then
-                                .header.request.headers.Host = []
+                            if .header.type == "http" then
+                                if .header.request.headers.Host == null then
+                                    .header.request.headers.Host = []
+                                elif (.header.request.headers.Host | type) == "string" then
+                                    .header.request.headers.Host = [.header.request.headers.Host]
+                                else . end
                             else . end
                         )
                     else . end |
@@ -808,12 +812,10 @@ activate_relay() {
     local mode="Relay"
 
     # Detect if config is simple enough for Relay Mode
-    local network=$(echo "$outbound" | jq -r '.streamSettings.network // "tcp"')
     local security=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
-    local tcp_header=$(echo "$outbound" | jq -r '.streamSettings.tcpSettings.header.type // "none"')
 
-    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]] && [[ "$network" == "tcp" ]] && [[ "$security" == "none" ]] && [[ "$tcp_header" == "none" ]]; then
-        # SMART RELAY MODE - Simple TCP
+    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]] && [[ "$security" == "none" ]]; then
+        # SMART RELAY MODE - Iran handles obfuscation (TCP, WS, HTTP Headers)
         mode="Relay"
         if [[ "$proto" == "vless" ]]; then
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
@@ -910,21 +912,23 @@ EOF
         if ss -tulnp | grep -q ":$iran_port "; then
              echo -e "${GREEN}[✔] Tunnel is ACTIVE and listening on port $iran_port.${NC}"
              if [[ "$mode" == "Relay" ]]; then
-                 echo -e "${YELLOW}MODE: Smart Protocol Relay${NC}"
+                 echo -e "${YELLOW}MODE: Smart Protocol Relay (Optimized)${NC}"
                  echo -e "In your v2rayNG/v2rayN client, create a ${CYAN}NEW SIMPLE CONFIG${NC}:"
                  echo -e " - Protocol: ${proto^^}"
                  echo -e " - Address: [Your Iran IP]"
                  echo -e " - Port: $iran_port"
                  echo -e " - UUID: $id"
-                 echo -e " - ${MAGENTA}Security/TLS: None${NC}"
-                 echo -e " - ${MAGENTA}Transport: TCP${NC}"
-                 echo -e "Iran server handles the complex connection to Kharej for you."
+                 [[ "$proto" == "vmess" ]] && echo -e " - AlterId: 0"
+                 echo -e " - Security: auto"
+                 echo -e " - ${MAGENTA}Transport: TCP (No Headers/None)${NC}"
+                 echo -e " - ${MAGENTA}TLS/Reality: None${NC}"
+                 echo -e "\n${GREEN}Success:${NC} Iran server now handles all complex headers/WS for you."
              else
-                 echo -e "${YELLOW}MODE: Smart Transparent Bridge${NC}"
+                 echo -e "${YELLOW}MODE: Smart Transparent Bridge (TLS/CDN)${NC}"
                  echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC} on your phone, but change:"
                  echo -e " - Address: [Your Iran IP]"
                  echo -e " - Port: $iran_port"
-                 echo -e "Everything else (TLS, WS, CDN, headers) must stay the same."
+                 echo -e "\n${WHITE}Everything else (TLS, WS, CDN, headers) MUST stay exactly the same.${NC}"
              fi
         else
              echo -e "${RED}[!] Service is running but port $iran_port is not listening.${NC}"
@@ -987,12 +991,15 @@ saved_relays_menu() {
                if [[ -n "$new_name" ]]; then
                    mv "${SAVED_RELAYS_DIR}/${selected}.json" "${SAVED_RELAYS_DIR}/${new_name}.json"
                    echo -e "${GREEN}Renamed.${NC}"; sleep 1
-                   continue
                fi
+               continue
                ;;
             5)
-               rm "${SAVED_RELAYS_DIR}/${selected}.json"
-               echo -e "${RED}Deleted.${NC}"; sleep 1
+               read -p "Are you sure you want to delete '$selected'? (y/n): " confirm_del
+               if [[ "$confirm_del" == "y" ]]; then
+                   rm "${SAVED_RELAYS_DIR}/${selected}.json"
+                   echo -e "${RED}Deleted.${NC}"; sleep 1
+               fi
                continue
                ;;
             6) break ;;
