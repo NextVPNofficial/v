@@ -388,18 +388,20 @@ install_xray_menu() {
     display_logo
     echo -e "${CYAN}--- Xray-core Installation ---${NC}"
     echo -e "1. Download Latest from GitHub"
-    echo -e "2. Download from Custom URL"
-    echo -e "3. Install from Local File (${CONFIG_DIR}/xray.zip)"
-    echo -e "4. Back"
+    echo -e "2. Download from Iranbax Mirror (Fast)"
+    echo -e "3. Download from Custom URL"
+    echo -e "4. Install from Local File (${CONFIG_DIR}/xray.zip)"
+    echo -e "5. Back"
     echo ''
-    read_num "Choose method: " "x_inst_choice" 1 4
+    read_num "Choose method: " "x_inst_choice" 1 5
     case $x_inst_choice in
         1) download_xray ;;
-        2)
+        2) download_xray "https://iranbax.cloud/file/4444/xray.zip" ;;
+        3)
            read -p "Enter Custom URL: " x_url
            download_xray "$x_url"
            ;;
-        3)
+        4)
            local lzip="${CONFIG_DIR}/xray.zip"
            if [[ -f "$lzip" ]]; then
                mkdir -p "$XRAY_CORE_DIR"
@@ -410,6 +412,7 @@ install_xray_menu() {
                echo -e "${RED}File $lzip not found!${NC}"; sleep 2
            fi
            ;;
+        5) return ;;
     esac
 }
 
