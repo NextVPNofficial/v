@@ -209,14 +209,14 @@ get_public_ip() {
     # 1. Try fetching via installation proxy if active
     if pgrep -f "ssh -D 1080" > /dev/null; then
         for provider in "${providers[@]}"; do
-            ip=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 2 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
+            ip=$(curl -s --socks5-hostname 127.0.0.1:1080 --max-time 1 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
             [[ -n "$ip" ]] && { echo "${ip} (via Proxy)"; return; }
         done
     fi
 
     # 2. Try direct fetch
     for provider in "${providers[@]}"; do
-        ip=$(curl -s --max-time 2 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
+        ip=$(curl -s --max-time 1 "$provider" 2>/dev/null | grep -oE '^[0-9.]+$')
         [[ -n "$ip" ]] && { echo "$ip"; return; }
     done
 
@@ -234,7 +234,7 @@ get_tunnel_status() {
         if systemctl is-active --quiet "$XRAY_RELAY_SERVICE"; then
             check="${GREEN}ONLINE${NC}"
             local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_RELAY_CONFIG" | head -n1)
-            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+            if [[ -n "$iran_port" ]] && ss -tulnp | grep -q ":$iran_port "; then
                 check="${GREEN}WORKS:${iran_port}${NC}"
             fi
         fi
@@ -248,7 +248,7 @@ get_tunnel_status() {
         if systemctl is-active --quiet "$XRAY_SERVICE"; then
             check="${GREEN}ONLINE${NC}"
             local iran_port=$(grep -oP '"port": \K[0-9]+' "$XRAY_CONFIG" | head -n1)
-            if [[ -n "$iran_port" ]] && curl --connect-timeout 1 -s 127.0.0.1:$iran_port >/dev/null 2>&1; then
+            if [[ -n "$iran_port" ]] && ss -tulnp | grep -q ":$iran_port "; then
                 check="${GREEN}WORKS:${iran_port}${NC}"
             fi
         fi
