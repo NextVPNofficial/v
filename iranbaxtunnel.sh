@@ -611,7 +611,8 @@ parse_vmess_link() {
                 "wsSettings": (if $net == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
                 "grpcSettings": (if $net == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
-            }
+            },
+            "mux": {"enabled": false}
         } | del(..|nulls)'
 }
 
@@ -700,7 +701,8 @@ parse_vless_link() {
                 "wsSettings": (if $type == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
                 "grpcSettings": (if $type == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
-            }
+            },
+            "mux": {"enabled": false}
         } | del(..|nulls)'
 }
 
@@ -866,7 +868,7 @@ activate_relay() {
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
         '{
-          "log": { "access": "none", "dnsLog": false, "error": "", "loglevel": "warning", "maskAddress": "" },
+          "log": { "access": "none", "dnsLog": false, "loglevel": "warning" },
           "api": { "services": ["HandlerService", "LoggerService", "StatsService"], "tag": "api" },
           "stats": {},
           "policy": {
@@ -881,7 +883,8 @@ activate_relay() {
           "outbounds": [
             ($outb | .tag = "outbound-relay"),
             { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
-            { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
+            { "protocol": "blackhole", "settings": {}, "tag": "blocked" },
+            { "protocol": "freedom", "settings": {}, "tag": "api" }
           ],
           "routing": {
             "domainStrategy": "IPOnDemand",
