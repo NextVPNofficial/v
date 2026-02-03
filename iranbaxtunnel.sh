@@ -583,6 +583,7 @@ parse_vmess_link() {
     local tls_type=$(echo "$decoded" | jq -r '.tls')
     local security=$(echo "$decoded" | jq -r '.scy // "auto"')
     local alpn=$(echo "$decoded" | jq -r '.alpn // empty')
+    local service_name=$(echo "$decoded" | jq -r '.serviceName // empty')
 
     jq -n \
         --arg uuid "$uuid" \
@@ -597,6 +598,7 @@ parse_vmess_link() {
         --arg tls "$tls_type" \
         --arg scy "$security" \
         --arg alpn "$alpn" \
+        --arg srv "$service_name" \
         '{
             "protocol": "vmess",
             "settings": {
@@ -607,6 +609,7 @@ parse_vmess_link() {
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "wsSettings": (if $net == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
+                "grpcSettings": (if $net == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
             }
         } | del(..|nulls)'
@@ -614,42 +617,56 @@ parse_vmess_link() {
 
 parse_vless_link() {
     local link=$1
-    # Basic robust parser for vless://uuid@host:port?params#tag
+    # Robust parser for vless://uuid@host:port?params#tag
     local body=$(echo "$link" | sed 's/vless:\/\///')
     local uuid=$(echo "$body" | awk -F'@' '{print $1}')
     local rest=$(echo "$body" | awk -F'@' '{print $2}')
-    local host_port=$(echo "$rest" | awk -F'?' '{print $1}')
+    local host_port=$(echo "$rest" | awk -F'?' '{print $1}' | awk -F'#' '{print $1}')
     local params=$(echo "$rest" | awk -F'?' '{print $2}' | awk -F'#' '{print $1}')
     local host=$(echo "$host_port" | awk -F':' '{print $1}')
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
+    [[ -z "$port" ]] && port="443"
 
-    # Function to extract param value
-    get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g; s/%23/#/g; s/%26/\&/g'; }
+    # Improved decoding function
+    get_p() {
+        local val=$(echo "$params" | grep -oP "$1=\K[^&]+" | head -n1)
+        [[ -z "$val" ]] && return
+        printf '%b' "${val//%/\\x}"
+    }
 
     local type=$(get_p "type")
+    [[ -z "$type" ]] && type="tcp"
     local header_type=$(get_p "headerType")
+    [[ -z "$header_type" ]] && header_type="none"
     local path=$(get_p "path")
     [[ -z "$path" ]] && path="/"
+
     # Heuristic: If type is tcp and path is present but headerType is missing, it might be HTTP
-    if [[ "$type" == "tcp" || -z "$type" ]] && [[ -n "$path" && "$path" != "/" && -z "$header_type" ]]; then
+    if [[ "$type" == "tcp" ]] && [[ -n "$path" && "$path" != "/" && "$header_type" == "none" ]]; then
         header_type="http"
     fi
-    [[ -z "$type" ]] && type="tcp"
-    [[ -z "$header_type" ]] && header_type="none"
+
     local security=$(get_p "security")
+    [[ -z "$security" ]] && security="none"
+
     local sni=$(get_p "sni")
     [[ -z "$sni" ]] && sni=$(get_p "peer")
     [[ -z "$sni" ]] && sni=$(get_p "host")
     [[ -z "$sni" ]] && sni="$host"
+
+    local ws_host=$(get_p "host")
+    [[ -z "$ws_host" ]] && ws_host="$sni"
+
     local flow=$(get_p "flow")
     local fp=$(get_p "fp")
+    [[ -z "$fp" ]] && fp="chrome"
     local alpn=$(get_p "alpn")
+    local pbk=$(get_p "pbk")
+    local sid=$(get_p "sid")
+    local service_name=$(get_p "serviceName")
+
     local insecure=$(get_p "insecure")
     [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
-    local ws_host=$(get_p "host")
-    [[ -z "$ws_host" ]] && ws_host=$(get_p "sni")
-    [[ -z "$ws_host" ]] && ws_host=$(get_p "peer")
-
     local allow_ins=false
     [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
 
@@ -657,15 +674,18 @@ parse_vless_link() {
         --arg uuid "$uuid" \
         --arg host "$host" \
         --arg port "$port" \
-        --arg type "${type:-tcp}" \
-        --arg h_type "${header_type:-none}" \
-        --arg security "${security:-none}" \
+        --arg type "$type" \
+        --arg h_type "$header_type" \
+        --arg security "$security" \
         --arg sni "$sni" \
-        --arg path "${path:-/}" \
+        --arg path "$path" \
         --arg flow "$flow" \
-        --arg fp "${fp:-chrome}" \
+        --arg fp "$fp" \
         --arg alpn "$alpn" \
         --arg ws_host "$ws_host" \
+        --arg pbk "$pbk" \
+        --arg sid "$sid" \
+        --arg srv "$service_name" \
         --argjson allow_ins "$allow_ins" \
         '{
             "protocol": "vless",
@@ -676,8 +696,9 @@ parse_vless_link() {
                 "network": $type,
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
+                "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "publicKey": $pbk, "shortId": $sid, "spiderX": "/"} else null end),
                 "wsSettings": (if $type == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
+                "grpcSettings": (if $type == "grpc" then {"serviceName": $srv, "multiMode": true} else null end),
                 "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
             }
         } | del(..|nulls)'
@@ -811,11 +832,8 @@ activate_relay() {
     local actual_outbound=""
     local mode="Relay"
 
-    # Detect if config is simple enough for Relay Mode
-    local security=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
-
-    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]] && [[ "$security" == "none" ]]; then
-        # SMART RELAY MODE - Iran handles obfuscation (TCP, WS, HTTP Headers)
+    # SMART RELAY MODE for VLESS/VMess (Iran handles obfuscation/TLS/WS)
+    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]]; then
         mode="Relay"
         if [[ "$proto" == "vless" ]]; then
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
