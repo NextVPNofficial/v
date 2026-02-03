@@ -716,41 +716,40 @@ setup_xray_relay() {
                             "port": ($port | tonumber),
                             "users": [{
                                 "id": $id,
-                                "encryption": (if .protocol == "vless" then $enc else null end),
-                                "security": (if .protocol == "vmess" then $sec else null end),
+                                "encryption": (if .protocol == "vless" then ($enc // "none") else null end),
+                                "security": (if .protocol == "vmess" then ($sec // "auto") else null end),
                                 "flow": (if $flow != "" then $flow else null end)
                             }]
                         }]
                     } |
-                    # Standardize StreamSettings (Safe navigation with ?)
+                    # Standardize StreamSettings
                     if .streamSettings then
                         # Set security to none if it is empty string
                         if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
 
-                        # Fix WS headers while preserving existing fields
+                        # Fix WS headers (jq 1.6 compatible)
                         if .streamSettings.wsSettings then
-                            if .streamSettings.wsSettings.host and (.streamSettings.wsSettings.headers?.Host | not) then
-                                .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
-                            else . end
+                            .streamSettings.wsSettings |= (
+                                if .host and (.headers.Host == null) then
+                                    .headers = (.headers // {}) | .headers.Host = .host
+                                else . end
+                            )
                         else . end |
 
-                        # Fix xHTTP headers while preserving existing fields
+                        # Fix xHTTP headers
                         if .streamSettings.xhttpSettings then
-                            if .streamSettings.xhttpSettings.host and (.streamSettings.xhttpSettings.headers?.Host | not) then
-                                .streamSettings.xhttpSettings.headers.Host = .streamSettings.xhttpSettings.host
-                            else . end
+                            .streamSettings.xhttpSettings |= (
+                                if .host and (.headers.Host == null) then
+                                    .headers = (.headers // {}) | .headers.Host = .host
+                                else . end
+                            )
                         else . end |
 
                         # Fix TLS SNI and ensure advanced fields are kept
                         if .streamSettings.tlsSettings then
-                            if (.streamSettings.tlsSettings.serverName | not) then
-                                if .streamSettings.wsSettings?.headers?.Host then
-                                    .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
-                                elif .streamSettings.xhttpSettings?.headers?.Host then
-                                    .streamSettings.tlsSettings.serverName = .streamSettings.xhttpSettings.headers.Host
-                                else
-                                    .streamSettings.tlsSettings.serverName = ($addr | tostring)
-                                end
+                            if (.streamSettings.tlsSettings.serverName == null) then
+                                (.streamSettings.wsSettings.headers.Host // .streamSettings.xhttpSettings.headers.Host // .streamSettings.tcpSettings.header.request.headers.Host[0] // ($addr | tostring)) as $sni |
+                                .streamSettings.tlsSettings.serverName = $sni
                             else . end
                         else . end
                     else . end
@@ -802,12 +801,14 @@ activate_relay() {
 
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
-    echo -e "\nChoose Tunnel Type:"
-    echo "1. Relay Mode (Act as Client) - Recommended for simple setup"
-    echo "   Iran server handles TLS/WS. You connect to Iran with a simple VLESS/VMESS config."
-    echo "2. Bridge Mode (Pass-through) - Recommended for Marzban/Panels"
+    echo -e "\nChoose Entry Protocol for Iran Server:"
+    echo "1. Relay Mode (VLESS/VMess) - Recommended"
+    echo "   Iran server acts as client for Kharej. You use a simple config on your phone."
+    echo "2. SOCKS5 + HTTP Proxy"
+    echo "   Iran server provides a SOCKS/HTTP port. Best for simple apps."
+    echo "3. Bridge Mode (Transparent) - Recommended for Marzban/Panels"
     echo "   Iran acts as a pipe. You use the EXACT SAME config in your client, just change IP to Iran."
-    read_num "Choice (default: 1): " "t_choice" 1 2
+    read_num "Choice (default: 1): " "t_choice" 1 3
     t_choice=${t_choice:-1}
 
     local inbound_json=""
@@ -829,51 +830,79 @@ activate_relay() {
                 "tag": "inbound-relay"
             }')
         else
-            # Fallback for plain freedom or other types
-            t_choice=2
+            # Fallback to bridge if protocol unknown
+            t_choice=3
         fi
         actual_outbound="$outbound"
     fi
 
     if [[ "$t_choice" == "2" ]]; then
-        # BRIDGE MODE - Unified Transparent Pipe
+        # SOCKS5 + HTTP
         inbound_json=$(jq -n --argjson p "$iran_port" '{
-            "port": $p, "protocol": "dokodemo-door",
-            "settings": { "network": "tcp,udp", "followRedirect": true },
-            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
-            "tag": "inbound-bridge"
+            "port": $p, "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": true },
+            "tag": "inbound-relay"
         }')
-        # We use freedom redirect to force the destination, which bypasses any sniffing override issues
-        actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson rp "$remote_port" '{
-            "protocol": "freedom",
-            "settings": {
-                "redirect": ($addr + ":" + ($rp|tostring)),
-                "domainStrategy": "UseIP"
-            },
-            "tag": "outbound-relay"
-        }')
-        in_tag="inbound-bridge"
+        actual_outbound="$outbound"
     fi
 
-    # Safe JSON assembly using jq
+    if [[ "$t_choice" == "3" ]]; then
+        # BRIDGE MODE - Pure Dokodemo
+        inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+            "port": $p, "protocol": "dokodemo-door",
+            "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
+            "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"] },
+            "tag": "inbound-relay"
+        }')
+        actual_outbound=$(jq -n '{ "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "outbound-relay" }')
+    fi
+
+    # Refactored JSON assembly to match X-UI structure provided by the user
     jq -n \
         --argjson inb "$inbound_json" \
         --argjson outb "$actual_outbound" \
         --arg in_tag "$in_tag" \
         '{
-          "log": { "loglevel": "warning" },
-          "dns": {
-            "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+          "api": {
+            "services": ["HandlerService", "LoggerService", "StatsService"],
+            "tag": "api"
           },
-          "inbounds": [$inb],
-          "outbounds": [($outb | .tag = "outbound-relay"), {"protocol": "freedom", "tag": "direct"}],
+          "inbounds": [
+            {
+              "listen": "127.0.0.1",
+              "port": 62789,
+              "protocol": "dokodemo-door",
+              "settings": { "address": "127.0.0.1" },
+              "tag": "api"
+            },
+            $inb
+          ],
+          "log": {
+            "access": "none",
+            "dnsLog": false,
+            "error": "",
+            "loglevel": "warning",
+            "maskAddress": ""
+          },
+          "outbounds": [
+            ($outb | .tag = "outbound-relay"),
+            { "protocol": "freedom", "settings": { "domainStrategy": "UseIP" }, "tag": "direct" },
+            { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
+          ],
+          "policy": {
+            "levels": { "0": { "statsUserDownlink": true, "statsUserUplink": true } },
+            "system": { "statsInboundDownlink": true, "statsInboundUplink": true }
+          },
           "routing": {
-            "domainStrategy": "IPOnDemand",
+            "domainStrategy": "AsIs",
             "rules": [
-              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" },
-              { "type": "field", "outboundTag": "direct", "network": "udp,tcp" }
+              { "inboundTag": ["api"], "outboundTag": "api", "type": "field" },
+              { "ip": ["geoip:private"], "outboundTag": "blocked", "type": "field" },
+              { "outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field" },
+              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" }
             ]
-          }
+          },
+          "stats": {}
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
 
     cat << EOF > "/etc/systemd/system/${XRAY_RELAY_SERVICE}"
@@ -917,7 +946,13 @@ EOF
                  echo -e " - ${CYAN}Security/TLS: None${NC}"
                  echo -e " - ${CYAN}Transport: TCP (no WS/HTTP/etc)${NC}"
                  echo -e "Iran server handles the complex Kharej connection for you."
-             else
+             elif [[ "$t_choice" == "2" ]]; then
+                 echo -e "${YELLOW}IMPORTANT (SOCKS5/HTTP Mode):${NC}"
+                 echo -e "Connect your browser or app to:"
+                 echo -e " - ${CYAN}Type: SOCKS5 (or HTTP)${NC}"
+                 echo -e " - ${CYAN}Address: [Iran IP]${NC}"
+                 echo -e " - ${CYAN}Port: $iran_port${NC}"
+             elif [[ "$t_choice" == "3" ]]; then
                  echo -e "${YELLOW}IMPORTANT (Bridge Mode):${NC}"
                  echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC}, but change:"
                  echo -e " - ${CYAN}Address: [Iran IP]${NC}"
@@ -979,17 +1014,18 @@ saved_relays_menu() {
                read -p "Press Enter to continue..."
                ;;
             3) edit_relay "$selected" ;;
-            3)
+            4)
                read -p "Enter new name: " new_name
                if [[ -n "$new_name" ]]; then
                    mv "${SAVED_RELAYS_DIR}/${selected}.json" "${SAVED_RELAYS_DIR}/${new_name}.json"
                    echo -e "${GREEN}Renamed.${NC}"; sleep 1
                fi
                ;;
-            4)
+            5)
                rm "${SAVED_RELAYS_DIR}/${selected}.json"
                echo -e "${RED}Deleted.${NC}"; sleep 1
                ;;
+            6) break ;;
             *) continue ;;
         esac
     done
