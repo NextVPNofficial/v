@@ -579,7 +579,6 @@ parse_vmess_link() {
     local ws_host=$(echo "$decoded" | jq -r '.host // empty')
     local sni=$(echo "$decoded" | jq -r '.sni // empty')
     [[ -z "$ws_host" || "$ws_host" == "null" ]] && ws_host="$sni"
-    [[ -z "$ws_host" || "$ws_host" == "null" ]] && ws_host="$host"
     [[ -z "$sni" || "$sni" == "null" ]] && sni="$ws_host"
     local tls_type=$(echo "$decoded" | jq -r '.tls')
     local security=$(echo "$decoded" | jq -r '.scy // "auto"')
@@ -607,8 +606,8 @@ parse_vmess_link() {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end),
-                "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [$ws_host]}}}} else null end)
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
+                "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
             }
         } | del(..|nulls)'
 }
@@ -635,6 +634,8 @@ parse_vless_link() {
     if [[ "$type" == "tcp" || -z "$type" ]] && [[ -n "$path" && "$path" != "/" && -z "$header_type" ]]; then
         header_type="http"
     fi
+    [[ -z "$type" ]] && type="tcp"
+    [[ -z "$header_type" ]] && header_type="none"
     local security=$(get_p "security")
     local sni=$(get_p "sni")
     [[ -z "$sni" ]] && sni=$(get_p "peer")
@@ -647,7 +648,7 @@ parse_vless_link() {
     [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
     local ws_host=$(get_p "host")
     [[ -z "$ws_host" ]] && ws_host=$(get_p "sni")
-    [[ -z "$ws_host" ]] && ws_host="$host"
+    [[ -z "$ws_host" ]] && ws_host=$(get_p "peer")
 
     local allow_ins=false
     [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
@@ -676,8 +677,8 @@ parse_vless_link() {
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end),
-                "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [$ws_host]}}}} else null end)
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": (if $ws_host != "" then {"Host": $ws_host} else {} end)} else null end),
+                "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": (if $ws_host != "" then [$ws_host] else [] end)}}}} else null end)
             }
         } | del(..|nulls)'
 }
@@ -728,6 +729,20 @@ setup_xray_relay() {
                         .streamSettings.wsSettings |= (
                             if .host and (.headers.Host == null) then
                                 .headers = (.headers // {}) | .headers.Host = .host
+                            else . end
+                        )
+                    else . end |
+                    if .streamSettings.xhttpSettings then
+                        .streamSettings.xhttpSettings |= (
+                            if .host and (.headers.Host == null) then
+                                .headers = (.headers // {}) | .headers.Host = .host
+                            else . end
+                        )
+                    else . end |
+                    if .streamSettings.tcpSettings then
+                        .streamSettings.tcpSettings |= (
+                            if .header.type == "http" and .header.request.headers.Host == null then
+                                .header.request.headers.Host = []
                             else . end
                         )
                     else . end |
@@ -792,8 +807,13 @@ activate_relay() {
     local actual_outbound=""
     local mode="Relay"
 
-    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]]; then
-        # SMART RELAY MODE - Auto UUID Matching
+    # Detect if config is simple enough for Relay Mode
+    local network=$(echo "$outbound" | jq -r '.streamSettings.network // "tcp"')
+    local security=$(echo "$outbound" | jq -r '.streamSettings.security // "none"')
+    local tcp_header=$(echo "$outbound" | jq -r '.streamSettings.tcpSettings.header.type // "none"')
+
+    if [[ "$proto" == "vless" || "$proto" == "vmess" ]] && [[ -n "$id" ]] && [[ "$network" == "tcp" ]] && [[ "$security" == "none" ]] && [[ "$tcp_header" == "none" ]]; then
+        # SMART RELAY MODE - Simple TCP
         mode="Relay"
         if [[ "$proto" == "vless" ]]; then
             inbound_json=$(jq -n --argjson p "$iran_port" --arg id "$id" '{
@@ -810,7 +830,7 @@ activate_relay() {
         fi
         actual_outbound="$outbound"
     else
-        # SMART BRIDGE MODE - Transparent Pipe
+        # SMART BRIDGE MODE - Transparent Pipe (For WS, TLS, CDN, HTTP Headers)
         mode="Bridge"
         inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
             "port": $p, "protocol": "dokodemo-door",
@@ -844,7 +864,7 @@ activate_relay() {
             { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
           ],
           "routing": {
-            "domainStrategy": "AsIs",
+            "domainStrategy": "IPOnDemand",
             "rules": [
               { "inboundTag": ["api"], "outboundTag": "api", "type": "field" },
               { "ip": ["geoip:private"], "outboundTag": "blocked", "type": "field" },
@@ -891,19 +911,20 @@ EOF
              echo -e "${GREEN}[✔] Tunnel is ACTIVE and listening on port $iran_port.${NC}"
              if [[ "$mode" == "Relay" ]]; then
                  echo -e "${YELLOW}MODE: Smart Protocol Relay${NC}"
-                 echo -e "In your v2rayNG/v2rayN client, create a ${CYAN}SIMPLE CONFIG${NC}:"
-                 echo -e " - Protocol: $proto"
-                 echo -e " - Address: [Iran IP]"
+                 echo -e "In your v2rayNG/v2rayN client, create a ${CYAN}NEW SIMPLE CONFIG${NC}:"
+                 echo -e " - Protocol: ${proto^^}"
+                 echo -e " - Address: [Your Iran IP]"
                  echo -e " - Port: $iran_port"
                  echo -e " - UUID: $id"
                  echo -e " - ${MAGENTA}Security/TLS: None${NC}"
                  echo -e " - ${MAGENTA}Transport: TCP${NC}"
-                 echo -e "Iran server handles the encryption to Kharej for you."
+                 echo -e "Iran server handles the complex connection to Kharej for you."
              else
                  echo -e "${YELLOW}MODE: Smart Transparent Bridge${NC}"
                  echo -e "Use your ${CYAN}EXACT SAME Kharej config${NC} on your phone, but change:"
-                 echo -e " - Address: [Iran IP]"
+                 echo -e " - Address: [Your Iran IP]"
                  echo -e " - Port: $iran_port"
+                 echo -e "Everything else (TLS, WS, CDN, headers) must stay the same."
              fi
         else
              echo -e "${RED}[!] Service is running but port $iran_port is not listening.${NC}"
