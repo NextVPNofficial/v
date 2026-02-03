@@ -606,7 +606,7 @@ parse_vmess_link() {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}, "host": (if $ws_host != "" then $ws_host else $sni end)} else null end),
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}} else null end),
                 "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [(if $ws_host != "" then $ws_host else $sni end)]}}}} else null end)
             }
         } | del(..|nulls)'
@@ -674,7 +674,7 @@ parse_vless_link() {
                 "security": $security,
                 "tlsSettings": (if $security == "tls" then {"serverName": $sni, "fingerprint": $fp, "allowInsecure": $allow_ins, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
                 "realitySettings": (if $security == "reality" then {"serverName": $sni, "fingerprint": $fp, "spiderX": "/"} else null end),
-                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}, "host": $ws_host} else null end),
+                "wsSettings": (if $type == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end),
                 "tcpSettings": (if ($type == "tcp" and $h_type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [$ws_host]}}}} else null end)
             }
         } | del(..|nulls)'
@@ -726,19 +726,32 @@ setup_xray_relay() {
                     if .streamSettings then
                         # Set security to none if it is empty string
                         if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
-                        if .streamSettings.wsSettings?.host and (.streamSettings.wsSettings.headers?.Host | not) then
-                            .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
+
+                        # Fix WS headers
+                        if .streamSettings.wsSettings then
+                            if .streamSettings.wsSettings.host and (.streamSettings.wsSettings.headers?.Host | not) then
+                                .streamSettings.wsSettings.headers.Host = .streamSettings.wsSettings.host
+                            else . end
                         else . end |
-                        if .streamSettings.tlsSettings? and (.streamSettings.tlsSettings.serverName | not) and .streamSettings.wsSettings?.headers?.Host then
-                            .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
+
+                        # Fix xHTTP headers
+                        if .streamSettings.xhttpSettings then
+                            if .streamSettings.xhttpSettings.host and (.streamSettings.xhttpSettings.headers?.Host | not) then
+                                .streamSettings.xhttpSettings.headers.Host = .streamSettings.xhttpSettings.host
+                            else . end
                         else . end |
-                        if .streamSettings.xhttpSettings?.host and (.streamSettings.xhttpSettings.headers?.Host | not) then
-                            .streamSettings.xhttpSettings.headers.Host = .streamSettings.xhttpSettings.host
-                        else . end |
-                        # Fallback for SNI if missing in tlsSettings
-                        if .streamSettings.security == "tls" and (.streamSettings.tlsSettings?.serverName | not) then
-                            (.settings.vnext[0].address // .settings.address) as $fallback_sni |
-                            .streamSettings.tlsSettings.serverName = $fallback_sni
+
+                        # Fix TLS SNI
+                        if .streamSettings.tlsSettings then
+                            if (.streamSettings.tlsSettings.serverName | not) then
+                                if .streamSettings.wsSettings?.headers?.Host then
+                                    .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
+                                elif .streamSettings.xhttpSettings?.headers?.Host then
+                                    .streamSettings.tlsSettings.serverName = .streamSettings.xhttpSettings.headers.Host
+                                else
+                                    .streamSettings.tlsSettings.serverName = ($addr | tostring)
+                                end
+                            else . end
                         else . end
                     else . end
                 else . end
@@ -841,12 +854,16 @@ activate_relay() {
         --arg in_tag "$in_tag" \
         '{
           "log": { "loglevel": "warning" },
+          "dns": {
+            "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+          },
           "inbounds": [$inb],
-          "outbounds": [($outb | .tag = "outbound-relay")],
+          "outbounds": [($outb | .tag = "outbound-relay"), {"protocol": "freedom", "tag": "direct"}],
           "routing": {
-            "domainStrategy": "AsIs",
+            "domainStrategy": "IPOnDemand",
             "rules": [
-              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" }
+              { "type": "field", "inboundTag": [$in_tag], "outboundTag": "outbound-relay" },
+              { "type": "field", "outboundTag": "direct", "network": "udp,tcp" }
             ]
           }
         } | del(..|nulls)' > "$XRAY_RELAY_CONFIG"
@@ -928,15 +945,22 @@ saved_relays_menu() {
 
         echo -e "\n${YELLOW}Selected: $selected${NC}"
         echo "1. Connect (Activate)"
-        echo "2. Edit (Address/Host/Port)"
-        echo "3. Rename"
-        echo "4. Delete"
-        echo "5. Back"
-        read_num "Choose action: " "a_idx" 1 5
+        echo "2. Show Service Logs (Debug)"
+        echo "3. Edit (Address/Host/Port)"
+        echo "4. Rename"
+        echo "5. Delete"
+        echo "6. Back"
+        read_num "Choose action: " "a_idx" 1 6
 
         case $a_idx in
             1) activate_relay "$selected"; return ;;
-            2) edit_relay "$selected" ;;
+            2)
+               echo -e "${CYAN}Showing last 50 lines of logs for $selected...${NC}"
+               journalctl -u "$XRAY_RELAY_SERVICE" -n 50 --no-pager
+               echo ''
+               read -p "Press Enter to continue..."
+               ;;
+            3) edit_relay "$selected" ;;
             3)
                read -p "Enter new name: " new_name
                if [[ -n "$new_name" ]]; then
