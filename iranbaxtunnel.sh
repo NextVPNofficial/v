@@ -732,6 +732,9 @@ setup_xray_relay() {
                         if .streamSettings.tlsSettings? and (.streamSettings.tlsSettings.serverName | not) and .streamSettings.wsSettings?.headers?.Host then
                             .streamSettings.tlsSettings.serverName = .streamSettings.wsSettings.headers.Host
                         else . end |
+                        if .streamSettings.xhttpSettings?.host and (.streamSettings.xhttpSettings.headers?.Host | not) then
+                            .streamSettings.xhttpSettings.headers.Host = .streamSettings.xhttpSettings.host
+                        else . end |
                         # Fallback for SNI if missing in tlsSettings
                         if .streamSettings.security == "tls" and (.streamSettings.tlsSettings?.serverName | not) then
                             (.settings.vnext[0].address // .settings.address) as $fallback_sni |
@@ -788,27 +791,26 @@ activate_relay() {
     read_port "Enter IRAN Local Port (to listen on): " "iran_port" "true" 80
 
     if [[ "$iran_port" == "80" && ("$is_tls" == "tls" || "$is_tls" == "reality") ]]; then
-        echo -e "${YELLOW}Warning: Using port 80 for TLS/Reality traffic might be blocked in Iran.${NC}"
-        echo -e "${YELLOW}If it doesn't work, try using port 443 or another port.${NC}"
-        sleep 2
+        echo -e "${RED}⚠️  IMPORTANT WARNING: Port 80 is strictly for HTTP in many Iran Datacenters.${NC}"
+        echo -e "${YELLOW}Your config uses TLS/Reality. If you use Port 80, your connection will likely be DROPPED.${NC}"
+        echo -e "${YELLOW}RECOMMENDATION: Use Port 443, 8080, 8443 or any other port instead.${NC}"
+        read -p "Do you still want to use port 80? (y/n, default: n): " confirm_80
+        [[ "$confirm_80" != "y" ]] && { flush_stdin; activate_relay "$name"; return; }
     fi
 
-    # Unified Relay Mode: Use Dokodemo-door Inbound + Freedom Redirect Outbound
+    # Unified Relay Mode: Use Dokodemo-door Inbound + Freedom Outbound
     # This is the most robust way to relay complex configs (TLS, WS, CDN).
-    local inbound_json=$(jq -n --argjson p "$iran_port" '{
+    local inbound_json=$(jq -n --argjson p "$iran_port" --arg addr "$remote_addr" --argjson rp "$remote_port" '{
         "port": $p,
         "protocol": "dokodemo-door",
-        "settings": { "network": "tcp,udp", "followRedirect": false },
-        "sniffing": { "enabled": true, "metadataOnly": false },
+        "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
+        "sniffing": { "enabled": true },
         "tag": "inbound-unified"
     }')
 
-    local actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson rp "$remote_port" '{
+    local actual_outbound=$(jq -n '{
         "protocol": "freedom",
-        "settings": {
-            "redirect": ($addr + ":" + ($rp|tostring)),
-            "domainStrategy": "AsIs"
-        },
+        "settings": { "domainStrategy": "UseIP" },
         "tag": "outbound-relay"
     }')
 
