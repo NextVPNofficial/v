@@ -578,8 +578,9 @@ parse_vmess_link() {
     fi
     local ws_host=$(echo "$decoded" | jq -r '.host // empty')
     local sni=$(echo "$decoded" | jq -r '.sni // empty')
+    [[ -z "$ws_host" || "$ws_host" == "null" ]] && ws_host="$sni"
+    [[ -z "$ws_host" || "$ws_host" == "null" ]] && ws_host="$host"
     [[ -z "$sni" || "$sni" == "null" ]] && sni="$ws_host"
-    [[ -z "$sni" || "$sni" == "null" ]] && sni="$host"
     local tls_type=$(echo "$decoded" | jq -r '.tls')
     local security=$(echo "$decoded" | jq -r '.scy // "auto"')
     local alpn=$(echo "$decoded" | jq -r '.alpn // empty')
@@ -606,8 +607,8 @@ parse_vmess_link() {
                 "network": $net,
                 "security": (if $tls == "tls" then "tls" else "none" end),
                 "tlsSettings": (if $tls == "tls" then {"serverName": $sni, "allowInsecure": true, "alpn": (if $alpn != "" then ($alpn | split(",")) else ["http/1.1"] end)} else null end),
-                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": (if $ws_host != "" then $ws_host else $sni end)}} else null end),
-                "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [(if $ws_host != "" then $ws_host else $sni end)]}}}} else null end)
+                "wsSettings": (if $net == "ws" then {"path": $path, "headers": {"Host": $ws_host}} else null end),
+                "tcpSettings": (if ($net == "tcp" and $type == "http") then {"header": {"type": "http", "request": {"path": [$path], "headers": {"Host": [$ws_host]}}}} else null end)
             }
         } | del(..|nulls)'
 }
@@ -624,12 +625,12 @@ parse_vless_link() {
     local port=$(echo "$host_port" | awk -F':' '{print $2}')
 
     # Function to extract param value
-    get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g'; }
+    get_p() { echo "$params" | grep -oP "$1=\K[^&]+" | head -n1 | sed 's/%2F/\//g; s/%2B/+/g; s/%23/#/g; s/%26/\&/g'; }
 
     local type=$(get_p "type")
     local header_type=$(get_p "headerType")
     local path=$(get_p "path")
-    [[ -n "$path" ]] && path=$(echo "$path" | sed 's/%2F/\//g; s/%2B/+/g')
+    [[ -z "$path" ]] && path="/"
     # Heuristic: If type is tcp and path is present but headerType is missing, it might be HTTP
     if [[ "$type" == "tcp" || -z "$type" ]] && [[ -n "$path" && "$path" != "/" && -z "$header_type" ]]; then
         header_type="http"
@@ -645,7 +646,8 @@ parse_vless_link() {
     local insecure=$(get_p "insecure")
     [[ -z "$insecure" ]] && insecure=$(get_p "allowInsecure")
     local ws_host=$(get_p "host")
-    [[ -z "$ws_host" ]] && ws_host="$sni"
+    [[ -z "$ws_host" ]] && ws_host=$(get_p "sni")
+    [[ -z "$ws_host" ]] && ws_host="$host"
 
     local allow_ins=false
     [[ "$insecure" == "1" || "$insecure" == "true" ]] && allow_ins=true
@@ -696,13 +698,48 @@ setup_xray_relay() {
         outbound=$(parse_vmess_link "$input")
     elif echo "$input" | jq . >/dev/null 2>&1; then
         echo -e "${CYAN}Importing JSON configuration...${NC}"
-        # Non-destructive standardization: extract outbound if nested, ensure tag
+        # Non-destructive standardization: ensures valid Xray structure while preserving fields
         outbound=$(echo "$input" | jq '
             if type == "array" then .[0] else . end |
-            if type == "object" then
-                if .outbounds then .outbounds[0] else . end |
-                .tag = "outbound-relay"
-            else . end
+            if type == "object" and .outbounds then .outbounds[0] else . end |
+            if .protocol == "vless" or .protocol == "vmess" then
+                (.settings.address // .settings.vnext[0].address) as $addr |
+                (.settings.port // .settings.vnext[0].port) as $port |
+                ((.settings.id // .settings.users[0].id // .settings.vnext[0].users[0].id) | tostring) as $id |
+                (.settings.encryption // .settings.users[0].encryption // .settings.vnext[0].users[0].encryption // "none") as $enc |
+                (.settings.flow // .settings.users[0].flow // .settings.vnext[0].users[0].flow // "") as $flow |
+                (.settings.security // .settings.users[0].security // .settings.vnext[0].users[0].security // "auto") as $sec |
+
+                .settings = {
+                    "vnext": [{
+                        "address": ($addr | tostring),
+                        "port": ($port | tonumber),
+                        "users": [{
+                            "id": $id,
+                            "encryption": (if .protocol == "vless" then $enc else null end),
+                            "security": (if .protocol == "vmess" then $sec else null end),
+                            "flow": (if $flow != "" then $flow else null end)
+                        }]
+                    }]
+                } |
+                if .streamSettings then
+                    if .streamSettings.security == "" then .streamSettings.security = "none" else . end |
+                    if .streamSettings.wsSettings then
+                        .streamSettings.wsSettings |= (
+                            if .host and (.headers.Host == null) then
+                                .headers = (.headers // {}) | .headers.Host = .host
+                            else . end
+                        )
+                    else . end |
+                    if .streamSettings.tlsSettings then
+                        if (.streamSettings.tlsSettings.serverName == null) then
+                            (.streamSettings.wsSettings.headers.Host // .streamSettings.xhttpSettings.headers.Host // .streamSettings.tcpSettings.header.request.headers.Host[0] // ($addr | tostring)) as $sni |
+                            .streamSettings.tlsSettings.serverName = $sni
+                        else . end
+                    else . end
+                else . end
+            else . end |
+            .tag = "outbound-relay"
         ')
     else
         echo -e "${RED}Error: Invalid format. Paste JSON or vless/vmess link.${NC}"
@@ -929,11 +966,13 @@ saved_relays_menu() {
                if [[ -n "$new_name" ]]; then
                    mv "${SAVED_RELAYS_DIR}/${selected}.json" "${SAVED_RELAYS_DIR}/${new_name}.json"
                    echo -e "${GREEN}Renamed.${NC}"; sleep 1
+                   continue
                fi
                ;;
             5)
                rm "${SAVED_RELAYS_DIR}/${selected}.json"
                echo -e "${RED}Deleted.${NC}"; sleep 1
+               continue
                ;;
             6) break ;;
             *) continue ;;
