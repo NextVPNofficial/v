@@ -793,13 +793,12 @@ activate_relay() {
         "port": $p,
         "protocol": "dokodemo-door",
         "settings": { "address": $addr, "port": $rp, "network": "tcp,udp" },
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls"] },
         "tag": "inbound-unified"
     }')
 
-    local actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson port "$remote_port" '{
+    local actual_outbound=$(jq -n --arg addr "$remote_addr" --argjson rp "$remote_port" '{
         "protocol": "freedom",
-        "settings": { "redirect": ($addr + ":" + ($port|tostring)) },
+        "settings": { "redirect": ($addr + ":" + ($rp|tostring)) },
         "tag": "outbound-relay"
     }')
 
